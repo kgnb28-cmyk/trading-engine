@@ -20,7 +20,6 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # --- 2. HELPERS: UPSTOX API HANDLERS ---
-# (We use direct HTTP requests to avoid heavy SDK installations on low-end PC)
 
 def fetch_ltp(token, symbols):
     """
@@ -61,10 +60,8 @@ def construct_symbol(index, expiry, strike, opt_type):
     """
     Constructs the Upstox Trading Symbol.
     Format example: NSE_FO|NIFTY28DEC21500CE
-    Adjust the 'format_string' if your specific expiry format differs (e.g. 28DEC24 vs 28DEC)
     """
     # Standard Format: EXCHANGE|INDEX + EXPIRY + STRIKE + TYPE
-    # Example: NSE_FO|NIFTY26DEC24000CE
     prefix = "BSE_FO" if index == "SENSEX" else "NSE_FO"
     return f"{prefix}|{index}{expiry}{strike}{opt_type}"
 
@@ -79,7 +76,9 @@ if 'history' not in st.session_state:
 # --- 4. SIDEBAR CONTROLS ---
 with st.sidebar:
     st.header("🔐 Access")
-    access_token = st.text_area("Daily Access Token", height=70, type="password", help="Paste generated Upstox access token here")
+    
+    # ✅ CORRECTED LINE: Using text_input instead of text_area for password masking
+    access_token = st.text_input("Daily Access Token", type="password", help="Paste generated Upstox access token here")
     
     st.divider()
     
@@ -102,7 +101,7 @@ with st.sidebar:
 indices_config = {
     "NIFTY": {"key": "NSE_INDEX|Nifty 50", "step": 50},
     "BANKNIFTY": {"key": "NSE_INDEX|Nifty Bank", "step": 100},
-    "SENSEX": {"key": "BSE_INDEX|SENSEX", "step": 100} # Verify Sensex Key for your feed
+    "SENSEX": {"key": "BSE_INDEX|SENSEX", "step": 100} 
 }
 
 st.title("⚡ Dynamic Straddle Monitor")
@@ -140,8 +139,7 @@ def render_index_tab(index_name):
             pe_price = opt_data.get(pe_atm_sym, 0)
             straddle_price = ce_price + pe_price
             
-            # C. Dynamic SD Calculation (Logic: SD = Spot +/- (Straddle Price * Factor))
-            # Note: A simplified SD approximation using Straddle Premium
+            # C. Dynamic SD Calculation 
             sd_range = straddle_price 
             
             strikes = {
