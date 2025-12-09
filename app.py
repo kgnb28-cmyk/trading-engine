@@ -3,62 +3,59 @@ import pandas as pd
 import time
 import requests
 import math
-from datetime import datetime, timedelta
+from datetime import datetime, date
 
-# --- 1. CONFIGURATION & PAGE SETUP ---
-st.set_page_config(page_title="Straddle Command", layout="wide", page_icon="⚡")
+# --- 1. PAGE CONFIGURATION ---
+st.set_page_config(page_title="Straddle Monitor", layout="wide", page_icon="⚡")
 
-# Professional Dark UI CSS
+# --- 2. PROFESSIONAL STYLING (StraddleChart Clone) ---
 st.markdown("""
     <style>
-        .block-container {padding-top: 1rem; padding-bottom: 0rem;}
-        /* Hide default Streamlit menu/footer */
-        #MainMenu {visibility: hidden;}
-        footer {visibility: hidden;}
+        .block-container {padding-top: 1rem; padding-bottom: 2rem;}
         
-        /* Ticker Tape Styling */
-        .ticker-box {
-            background-color: #1E1E1E;
+        /* Card Styling for Info Deck */
+        .info-card {
+            background-color: #1e1e1e;
             padding: 10px;
-            border-radius: 5px;
+            border-radius: 8px;
             border: 1px solid #333;
             text-align: center;
-            margin-bottom: 10px;
         }
-        .ticker-label { font-size: 12px; color: #888; }
-        .ticker-price { font-size: 18px; color: #00FF00; font-weight: bold; }
+        .info-label { font-size: 11px; color: #aaa; text-transform: uppercase; letter-spacing: 1px; }
+        .info-value { font-size: 18px; color: #fff; font-weight: 600; }
+        .highlight-value { color: #00e676; } /* Green for Price */
         
-        /* Center Control Styling */
-        .control-deck {
-            background-color: #0E1117;
-            border-bottom: 1px solid #333;
-            padding: 10px 0px;
-            margin-bottom: 20px;
-            text-align: center;
+        /* Chart Container Border */
+        .chart-box {
+            border: 1px solid #333;
+            border-radius: 5px;
+            padding: 5px;
+            margin-top: 10px;
         }
     </style>
 """, unsafe_allow_html=True)
 
-# --- 2. GLOBAL STATE ---
-if 'data_store' not in st.session_state:
-    st.session_state['data_store'] = {} # Stores chart data per symbol
+# --- 3. GLOBAL STATE & CONFIG ---
+if 'store' not in st.session_state:
+    st.session_state['store'] = {} # Stores dataframe per panel
 
-# --- 3. UPSTOX API HANDLERS ---
-INDICES_MAP = {
+INDICES = {
     "NIFTY": {"key": "NSE_INDEX|Nifty 50", "step": 50},
     "BANKNIFTY": {"key": "NSE_INDEX|Nifty Bank", "step": 100},
-    "SENSEX": {"key": "BSE_INDEX|SENSEX", "step": 100}
+    "SENSEX": {"key": "BSE_INDEX|SENSEX", "step": 100},
+    "FINNIFTY": {"key": "NSE_INDEX|Nifty Fin Service", "step": 50},
 }
 
-def get_expiry_format(date_obj):
-    # Upstox Format: 26DEC24
+# --- 4. UPSTOX API HELPERS ---
+def get_upstox_expiry(date_obj):
+    # Formats date to '26DEC24'
     return date_obj.strftime("%d%b%y").upper()
 
 def construct_symbol(index, expiry, strike, type_):
     exch = "BSE_FO" if index == "SENSEX" else "NSE_FO"
     return f"{exch}|{index}{expiry}{strike}{type_}"
 
-def fetch_ltp(token, symbols):
+def fetch_data(token, symbols):
     if not token or not symbols: return {}
     url = "https://api.upstox.com/v2/market-quote/ltp"
     headers = {'Authorization': f'Bearer {token}', 'Accept': 'application/json'}
@@ -68,39 +65,43 @@ def fetch_ltp(token, symbols):
             data = resp.json().get('data', {})
             return {k: v['last_price'] for k, v in data.items()}
     except:
-        pass
+        return {}
     return {}
 
-# --- 4. DATA PROCESSING LOGIC ---
-def process_market_data(token, index_name, expiry_tag):
+# --- 5. THE CORE ENGINE (Calculations) ---
+def run_panel_logic(token, index_name, expiry_date):
     """
-    Core Logic: Fetches Spot -> Calculates Strikes -> Fetches Premiums -> Returns Row
+    Returns: (SpotPrice, ATMStrike, StraddlePrice, ChartDataDict, ErrorMsg)
     """
-    cfg = INDICES_MAP[index_name]
+    if not token: return 0, 0, 0, None, "Token Missing"
     
-    # 1. Get Spot
-    spot_map = fetch_ltp(token, [cfg['key']])
-    spot_price = spot_map.get(cfg['key'], 0)
+    cfg = INDICES[index_name]
+    expiry_tag = get_upstox_expiry(expiry_date)
     
-    if spot_price == 0:
-        return None # Market data failed
+    # 1. Fetch Spot
+    spot_map = fetch_data(token, [cfg['key']])
+    spot_price = spot_map.get(cfg['key'])
+    
+    # --- CRASH FIX: CHECK IF SPOT IS NONE ---
+    if spot_price is None or spot_price == 0:
+        return 0, 0, 0, None, "Waiting for Market Data..."
 
-    # 2. Calculate ATM & Fetch Straddle
+    # 2. Calculate Strikes
     atm_strike = round(spot_price / cfg['step']) * cfg['step']
+    
+    # 3. Fetch ATM Straddle (To get SD Width)
     ce_atm = construct_symbol(index_name, expiry_tag, atm_strike, "CE")
     pe_atm = construct_symbol(index_name, expiry_tag, atm_strike, "PE")
     
-    # Fetch ATM first to determine SD Width
-    atm_data = fetch_ltp(token, [ce_atm, pe_atm])
+    atm_data = fetch_data(token, [ce_atm, pe_atm])
     atm_prem = atm_data.get(ce_atm, 0) + atm_data.get(pe_atm, 0)
     
     if atm_prem == 0:
-        return None # Option data failed
-        
-    # 3. Dynamic Strike Selection (Based on Straddle Premium)
+        return spot_price, atm_strike, 0, None, "Options Data Unavailable"
+
+    # 4. Define SD Strikes (Dynamic)
     sd_val = atm_prem
-    
-    strikes = {
+    targets = {
         "ATM Straddle": {"c": atm_strike, "p": atm_strike},
         "1.0 SD": {"c": round((spot_price + sd_val)/cfg['step'])*cfg['step'], 
                    "p": round((spot_price - sd_val)/cfg['step'])*cfg['step']},
@@ -110,145 +111,104 @@ def process_market_data(token, index_name, expiry_tag):
                    "p": round((spot_price - sd_val*2.0)/cfg['step'])*cfg['step']}
     }
     
-    # 4. Fetch All Required Premiums
-    batch_symbols = []
-    for k, v in strikes.items():
-        batch_symbols.append(construct_symbol(index_name, expiry_tag, v['c'], "CE"))
-        batch_symbols.append(construct_symbol(index_name, expiry_tag, v['p'], "PE"))
+    # 5. Fetch All SD Premiums
+    symbols_to_fetch = []
+    for t in targets.values():
+        symbols_to_fetch.append(construct_symbol(index_name, expiry_tag, t['c'], "CE"))
+        symbols_to_fetch.append(construct_symbol(index_name, expiry_tag, t['p'], "PE"))
         
-    prem_map = fetch_ltp(token, batch_symbols)
+    premium_map = fetch_data(token, symbols_to_fetch)
     
-    # 5. Build Result Row
-    timestamp = datetime.now().strftime("%H:%M:%S")
-    row = {"Time": timestamp}
-    
-    for level_name, s in strikes.items():
-        c_sym = construct_symbol(index_name, expiry_tag, s['c'], "CE")
-        p_sym = construct_symbol(index_name, expiry_tag, s['p'], "PE")
-        combined = prem_map.get(c_sym, 0) + prem_map.get(p_sym, 0)
-        row[level_name] = combined
+    # 6. Build Result
+    chart_row = {"Time": datetime.now().strftime("%H:%M:%S")}
+    for name, t in targets.items():
+        c_s = construct_symbol(index_name, expiry_tag, t['c'], "CE")
+        p_s = construct_symbol(index_name, expiry_tag, t['p'], "PE")
+        chart_row[name] = premium_map.get(c_s, 0) + premium_map.get(p_s, 0)
         
-    return row, spot_price
+    return spot_price, atm_strike, atm_prem, chart_row, None
 
-# --- 5. UI COMPONENT: CHART WIDGET ---
-def render_chart_widget(title, data_key, height=500):
-    """Renders a single chart container"""
-    st.markdown(f"### {title}")
-    chart_spot = st.empty() # Placeholder for chart
-    
-    if data_key in st.session_state['data_store']:
-        df = st.session_state['data_store'][data_key]
-        if not df.empty:
-            # Reformat for multi-line chart
-            chart_data = df.set_index("Time")
+# --- 6. UI COMPONENT: THE PANEL ---
+def render_panel(panel_id, default_index):
+    """
+    Renders a single "StraddleChart" style panel.
+    """
+    # Unique keys for widgets using panel_id
+    with st.container(border=True):
+        
+        # A. HEADER CONTROLS (Index | Expiry)
+        c1, c2, c3 = st.columns([1.5, 1.5, 2])
+        with c1:
+            sel_index = st.selectbox(f"Index", list(INDICES.keys()), index=list(INDICES.keys()).index(default_index), key=f"idx_{panel_id}", label_visibility="collapsed")
+        with c2:
+            sel_date = st.date_input(f"Expiry", min_value=date.today(), key=f"date_{panel_id}", label_visibility="collapsed")
+        with c3:
+            st.caption(f"LIVE • {get_upstox_expiry(sel_date)}")
+
+        # B. RUN LOGIC
+        spot, atm, straddle, row_data, err = run_panel_logic(token, sel_index, sel_date)
+        
+        # C. INFO DECK (Stats Row)
+        # Layout: DTE | SPOT | ATM STRIKE | STRADDLE PRICE
+        dte = (sel_date - date.today()).days
+        
+        k1, k2, k3, k4 = st.columns(4)
+        
+        # HTML Cards for precise styling
+        k1.markdown(f"""<div class="info-card"><div class="info-label">DTE</div><div class="info-value">{dte}</div></div>""", unsafe_allow_html=True)
+        
+        if err:
+            st.warning(err)
+        else:
+            k2.markdown(f"""<div class="info-card"><div class="info-label">SPOT</div><div class="info-value">{spot}</div></div>""", unsafe_allow_html=True)
+            k3.markdown(f"""<div class="info-card"><div class="info-label">ATM STRIKE</div><div class="info-value">{atm}</div></div>""", unsafe_allow_html=True)
+            k4.markdown(f"""<div class="info-card"><div class="info-label">STRADDLE</div><div class="info-value highlight-value">{straddle:.2f}</div></div>""", unsafe_allow_html=True)
+
+            # D. CHART UPDATE
+            store_key = f"data_{panel_id}"
+            if store_key not in st.session_state['store']:
+                st.session_state['store'][store_key] = pd.DataFrame()
             
-            # Custom Color Palette
-            st.line_chart(
-                chart_data,
-                height=height,
-                color=["#FFFFFF", "#FFFF00", "#FFA500", "#FF0000"] # White, Yellow, Orange, Red
-            )
-    else:
-        st.info("Waiting for data...")
+            if row_data:
+                # Add new row
+                st.session_state['store'][store_key] = pd.concat(
+                    [st.session_state['store'][store_key], pd.DataFrame([row_data])], ignore_index=True
+                ).tail(300) # Keep last 300 points
+            
+            # E. RENDER CHART
+            chart_df = st.session_state['store'][store_key].set_index("Time")
+            st.line_chart(chart_df, height=350, color=["#ffffff", "#ffff00", "#ffa500", "#ff0000"])
 
-# --- 6. MAIN APP LAYOUT ---
+# --- 7. MAIN LAYOUT ---
 
-# A. SIDEBAR (Token Only)
+# SIDEBAR (Token Only)
 with st.sidebar:
     st.header("🔐 Access")
-    token = st.text_input("Token", type="password", label_visibility="collapsed", placeholder="Paste Upstox Token")
-    
+    token = st.text_input("Token", type="password", placeholder="Paste Upstox Token", label_visibility="collapsed")
     st.divider()
-    st.subheader("Layout")
-    view_mode = st.radio("Grid", ["Single View", "Split View (2x1)"], label_visibility="collapsed")
-    
+    layout_mode = st.radio("View Mode", ["Single Panel", "Dual Panel (Side-by-Side)"])
     st.divider()
-    run_feed = st.toggle("ACTIVATE SYSTEM", value=False)
-    refresh_rate = st.slider("Speed", 1, 5, 2)
+    active = st.toggle("ACTIVATE FEED", value=False)
+    
+    if st.button("Clear History"):
+        st.session_state['store'] = {}
 
-# B. TOP RIGHT: TICKER TAPE
-c1, c2, c3, c4 = st.columns([4, 1, 1, 1])
-spot_placeholders = {}
+# MAIN AREA
+st.title("Dynamic Straddle Monitor")
 
-with c2: 
-    st.markdown('<div class="ticker-box"><div class="ticker-label">NIFTY</div><div class="ticker-price" id="nifty-spot">--</div></div>', unsafe_allow_html=True)
-    spot_placeholders["NIFTY"] = st.empty()
-with c3: 
-    st.markdown('<div class="ticker-box"><div class="ticker-label">BANKNIFTY</div><div class="ticker-price" id="bn-spot">--</div></div>', unsafe_allow_html=True)
-    spot_placeholders["BANKNIFTY"] = st.empty()
-with c4: 
-    st.markdown('<div class="ticker-box"><div class="ticker-label">SENSEX</div><div class="ticker-price" id="sensex-spot">--</div></div>', unsafe_allow_html=True)
-    spot_placeholders["SENSEX"] = st.empty()
-
-# C. CENTER CONTROL DECK
-st.markdown("---")
-ctrl_col1, ctrl_col2, ctrl_col3 = st.columns([1, 2, 1])
-with ctrl_col2:
-    # The "Hover Down" Buttons (Dropdowns)
-    col_idx, col_exp = st.columns(2)
-    with col_idx:
-        selected_index = st.selectbox("Select Contract", ["NIFTY", "BANKNIFTY", "SENSEX"])
-    with col_exp:
-        # Defaults to Thursday of current week roughly
-        today = datetime.today()
-        selected_date = st.date_input("Select Expiry", min_value=today)
-        expiry_tag = get_expiry_format(selected_date)
-
-# D. CHART RENDERING AREA
-st.markdown("---")
-
-if view_mode == "Single View":
-    # 1 Big Chart
-    render_chart_widget(f"{selected_index} • {expiry_tag}", "MAIN_CHART", height=600)
+if layout_mode == "Single Panel":
+    render_panel("p1", "NIFTY")
 else:
-    # 2 Charts Side by Side (Example: Selected vs BankNifty)
-    g1, g2 = st.columns(2)
-    with g1:
-        render_chart_widget(f"{selected_index} (Main)", "MAIN_CHART", height=450)
-    with g2:
-        # Second chart defaults to BankNifty if Main is Nifty, else Nifty
-        sec_idx = "BANKNIFTY" if selected_index == "NIFTY" else "NIFTY"
-        render_chart_widget(f"{sec_idx} (Compare)", "SEC_CHART", height=450)
+    # 2x1 Grid (Side by Side)
+    col_left, col_right = st.columns(2)
+    with col_left:
+        render_panel("p1", "NIFTY")
+    with col_right:
+        render_panel("p2", "SENSEX")
 
-# --- 7. ENGINE LOOP ---
-if run_feed and token:
-    
-    # 1. Update Spots (All Indices)
-    # We fetch all spot keys to update the Top Right Ticker
-    spot_keys = [v['key'] for v in INDICES_MAP.values()]
-    all_spots = fetch_ltp(token, spot_keys)
-    
-    # Update Ticker Display
-    # Note: Streamlit doesn't support direct JS updates easily, so we use metrics or overwrite
-    # For this version, we will just print to console log to save UI renders, 
-    # or you can add st.metric logic here if you want them to flash.
-    
-    # 2. Update MAIN CHART Data
-    main_data, main_spot = process_market_data(token, selected_index, expiry_tag)
-    
-    if main_data:
-        if "MAIN_CHART" not in st.session_state['data_store']:
-            st.session_state['data_store']["MAIN_CHART"] = pd.DataFrame()
-        
-        # Append and Keep last 200 rows
-        st.session_state['data_store']["MAIN_CHART"] = pd.concat(
-            [st.session_state['data_store']["MAIN_CHART"], pd.DataFrame([main_data])], ignore_index=True
-        ).tail(200)
-
-    # 3. Update SECONDARY CHART (If Split View is On)
-    if view_mode != "Single View":
-        sec_idx = "BANKNIFTY" if selected_index == "NIFTY" else "NIFTY"
-        sec_data, _ = process_market_data(token, sec_idx, expiry_tag)
-        if sec_data:
-            if "SEC_CHART" not in st.session_state['data_store']:
-                st.session_state['data_store']["SEC_CHART"] = pd.DataFrame()
-            st.session_state['data_store']["SEC_CHART"] = pd.concat(
-                [st.session_state['data_store']["SEC_CHART"], pd.DataFrame([sec_data])], ignore_index=True
-            ).tail(200)
-
-    # 4. Loop Control
-    time.sleep(refresh_rate)
+# LOOP
+if active and token:
+    time.sleep(2)
     st.rerun()
-
 elif not token:
-    st.warning("⚠️ Please enter Access Token in Sidebar to start.")
+    st.info("👈 Paste Access Token in Sidebar to start.")
