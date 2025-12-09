@@ -1,113 +1,229 @@
 import streamlit as st
 import pandas as pd
 import time
+import requests
+import math
 from datetime import datetime
 
-# --- 1. UI CONFIGURATION (Ultra Light) ---
-st.set_page_config(
-    page_title="Algo Command",
-    page_icon="⚡",
-    layout="wide",
-    initial_sidebar_state="collapsed" # Collapsed to save RAM/Space
-)
+# --- 1. CONFIGURATION & STYLING ---
+st.set_page_config(page_title="Upstox Algo Deck", page_icon="📈", layout="wide")
 
-# --- 2. FAST CSS (Removes Padding & Bloat) ---
+# Custom CSS for a "Trader's Dark Mode" look
 st.markdown("""
     <style>
-        .block-container {padding-top: 1rem; padding-bottom: 0rem;}
-        div[data-testid="stMetricValue"] {font-size: 28px; color: #00ff00;}
-        .stButton>button {width: 100%; border-radius: 5px; height: 3em;}
-        #MainMenu {visibility: hidden;}
-        footer {visibility: hidden;}
+        .block-container {padding-top: 1rem; padding-bottom: 2rem;}
+        div[data-testid="stMetricValue"] {font-size: 20px;}
+        .stTabs [data-baseweb="tab-list"] {gap: 10px;}
+        .stTabs [data-baseweb="tab"] {height: 50px; white-space: pre-wrap; background-color: #0e1117; border-radius: 5px;}
+        .stTabs [aria-selected="true"] {background-color: #262730;}
     </style>
 """, unsafe_allow_html=True)
 
-# --- 3. SESSION STATE SETUP ---
-if 'run_engine' not in st.session_state:
-    st.session_state['run_engine'] = False
-if 'logs' not in st.session_state:
-    st.session_state['logs'] = []
+# --- 2. HELPERS: UPSTOX API HANDLERS ---
+# (We use direct HTTP requests to avoid heavy SDK installations on low-end PC)
+
+def fetch_ltp(token, symbols):
+    """
+    Fetches LTP for a list of symbols from Upstox.
+    Format: "NSE_INDEX|Nifty 50" or "NSE_FO|NIFTY24DEC21000CE"
+    """
+    if not token:
+        return {}
+    
+    url = "https://api.upstox.com/v2/market-quote/ltp"
+    headers = {
+        'Accept': 'application/json',
+        'Authorization': f'Bearer {token}'
+    }
+    # Join symbols with commas
+    params = {'instrument_key': ",".join(symbols)}
+    
+    try:
+        response = requests.get(url, headers=headers, params=params, timeout=2)
+        data = response.json()
+        if 'data' in data:
+            # Return a simple dict: {'Symbol': Price}
+            return {k: v['last_price'] for k, v in data['data'].items()}
+    except Exception as e:
+        st.error(f"API Error: {e}")
+    return {}
+
+def get_strike_step(index_name):
+    if "NIFTY" in index_name and "BANK" not in index_name: return 50
+    if "BANKNIFTY" in index_name: return 100
+    if "SENSEX" in index_name: return 100
+    return 50
+
+def round_to_strike(price, step):
+    return round(price / step) * step
+
+def construct_symbol(index, expiry, strike, opt_type):
+    """
+    Constructs the Upstox Trading Symbol.
+    Format example: NSE_FO|NIFTY28DEC21500CE
+    Adjust the 'format_string' if your specific expiry format differs (e.g. 28DEC24 vs 28DEC)
+    """
+    # Standard Format: EXCHANGE|INDEX + EXPIRY + STRIKE + TYPE
+    # Example: NSE_FO|NIFTY26DEC24000CE
+    prefix = "BSE_FO" if index == "SENSEX" else "NSE_FO"
+    return f"{prefix}|{index}{expiry}{strike}{opt_type}"
+
+# --- 3. SESSION STATE ---
+if 'history' not in st.session_state:
+    st.session_state['history'] = {
+        'NIFTY': pd.DataFrame(),
+        'BANKNIFTY': pd.DataFrame(),
+        'SENSEX': pd.DataFrame()
+    }
 
 # --- 4. SIDEBAR CONTROLS ---
 with st.sidebar:
-    st.header("Control Panel")
+    st.header("🔐 Access")
+    access_token = st.text_area("Daily Access Token", height=70, type="password", help="Paste generated Upstox access token here")
     
-    # Large Toggle Buttons
-    col_start, col_stop = st.columns(2)
-    if col_start.button("🟢 START"):
-        st.session_state['run_engine'] = True
-    if col_stop.button("🔴 STOP"):
-        st.session_state['run_engine'] = False
-
     st.divider()
     
-    # Speed Control
-    refresh_rate = st.slider("Refresh Speed (s)", 0.5, 5.0, 1.0)
+    st.header("⚙️ Settings")
+    expiry_date = st.text_input("Expiry Tag", value="26DEC24", help="Format: DDMMMYY (e.g., 26DEC24)")
+    refresh_rate = st.slider("Update Speed (sec)", 1, 10, 2)
     
-    # Status Badge
-    status = "RUNNING" if st.session_state['run_engine'] else "STOPPED"
-    st.write(f"**Engine Status:** {status}")
-
-# --- 5. MAIN DASHBOARD UI (The "View") ---
-
-# Row A: Headline Metrics (The most important data)
-kpi1, kpi2, kpi3, kpi4 = st.columns(4)
-spot_display = kpi1.empty()
-ce_display = kpi2.empty()
-pe_display = kpi3.empty()
-pnl_display = kpi4.empty()
-
-st.divider()
-
-# Row B: Logs & Signals
-st.subheader("⚡ Live Trade Logs")
-log_table = st.empty()
-
-# --- 6. THE LOOP (Where You Paste Your Logic) ---
-if st.session_state['run_engine']:
+    run_engine = st.toggle("ACTIVATE FEED", value=False)
     
-    # This loop keeps running while the dashboard is open
-    while st.session_state['run_engine']:
+    if st.button("Clear Charts"):
+        st.session_state['history'] = {
+        'NIFTY': pd.DataFrame(),
+        'BANKNIFTY': pd.DataFrame(),
+        'SENSEX': pd.DataFrame()
+    }
+
+# --- 5. MAIN LOGIC ---
+
+# Defined Indices and their Spot Instrument Keys
+indices_config = {
+    "NIFTY": {"key": "NSE_INDEX|Nifty 50", "step": 50},
+    "BANKNIFTY": {"key": "NSE_INDEX|Nifty Bank", "step": 100},
+    "SENSEX": {"key": "BSE_INDEX|SENSEX", "step": 100} # Verify Sensex Key for your feed
+}
+
+st.title("⚡ Dynamic Straddle Monitor")
+
+# Create Tabs
+tab1, tab2, tab3 = st.tabs(["🟦 NIFTY 50", "🟩 BANK NIFTY", "🟪 SENSEX"])
+
+def render_index_tab(index_name):
+    """
+    Renders the UI and Logic for a single index tab.
+    """
+    cfg = indices_config[index_name]
+    
+    # 1. Placeholders for Layout
+    col_spot, col_straddle, col_iv = st.columns([1,2,1])
+    chart_container = st.empty()
+    table_container = st.empty()
+
+    if run_engine and access_token:
+        # A. Get Spot Price
+        ltp_data = fetch_ltp(access_token, [cfg['key']])
+        spot_price = ltp_data.get(cfg['key'], 0)
         
-        # =========================================================
-        # [YOUR AREA] PASTE YOUR LOGIC & API CALLS HERE
-        # =========================================================
-        
-        # 1. Get your data (Replace 0 with your variable)
-        my_ltp = 24100      # <--- Input: Current Market Price
-        my_ce_strike = 24300 # <--- Input: Your selected CE Strike
-        my_pe_strike = 23900 # <--- Input: Your selected PE Strike
-        my_pnl = 1500.50    # <--- Input: Total MTM
-        
-        # 2. Add a log entry (Replace strings with your signals)
-        new_log = {
-            "Time": datetime.now().strftime("%H:%M:%S"),
-            "Signal": "WAITING", # <--- Input: Your Decision
-            "Message": "Monitoring OTM premiums..." # <--- Input: Your Context
-        }
-        
-        # =========================================================
-        # [END USER AREA] UI UPDATES BELOW
-        # =========================================================
+        if spot_price > 0:
+            # B. Calculate ATM and Strikes
+            atm_strike = round_to_strike(spot_price, cfg['step'])
+            
+            # Construct ATM Symbols to get Straddle Price first
+            ce_atm_sym = construct_symbol(index_name, expiry_date, atm_strike, "CE")
+            pe_atm_sym = construct_symbol(index_name, expiry_date, atm_strike, "PE")
+            
+            # Fetch ATM Premiums
+            opt_data = fetch_ltp(access_token, [ce_atm_sym, pe_atm_sym])
+            ce_price = opt_data.get(ce_atm_sym, 0)
+            pe_price = opt_data.get(pe_atm_sym, 0)
+            straddle_price = ce_price + pe_price
+            
+            # C. Dynamic SD Calculation (Logic: SD = Spot +/- (Straddle Price * Factor))
+            # Note: A simplified SD approximation using Straddle Premium
+            sd_range = straddle_price 
+            
+            strikes = {
+                "ATM": {"ce": atm_strike, "pe": atm_strike},
+                "1.0 SD": {"ce": round_to_strike(spot_price + sd_range, cfg['step']), 
+                           "pe": round_to_strike(spot_price - sd_range, cfg['step'])},
+                "1.5 SD": {"ce": round_to_strike(spot_price + (sd_range*1.5), cfg['step']), 
+                           "pe": round_to_strike(spot_price - (sd_range*1.5), cfg['step'])},
+                "2.0 SD": {"ce": round_to_strike(spot_price + (sd_range*2.0), cfg['step']), 
+                           "pe": round_to_strike(spot_price - (sd_range*2.0), cfg['step'])},
+            }
+            
+            # Construct ALL symbols to fetch in one batch
+            batch_symbols = []
+            for k, v in strikes.items():
+                batch_symbols.append(construct_symbol(index_name, expiry_date, v['ce'], "CE"))
+                batch_symbols.append(construct_symbol(index_name, expiry_date, v['pe'], "PE"))
+            
+            # Fetch All SD Premiums
+            premium_data = fetch_ltp(access_token, batch_symbols)
+            
+            # D. Organize Data for Display
+            display_rows = []
+            timestamp = datetime.now().strftime("%H:%M:%S")
+            chart_updates = {"Time": timestamp}
+            
+            for sd_level, s in strikes.items():
+                ce_s = construct_symbol(index_name, expiry_date, s['ce'], "CE")
+                pe_s = construct_symbol(index_name, expiry_date, s['pe'], "PE")
+                
+                c_ltp = premium_data.get(ce_s, 0)
+                p_ltp = premium_data.get(pe_s, 0)
+                combined = c_ltp + p_ltp
+                
+                display_rows.append({
+                    "Level": sd_level,
+                    "CE Strike": s['ce'],
+                    "CE LTP": c_ltp,
+                    "PE Strike": s['pe'],
+                    "PE LTP": p_ltp,
+                    "Combined Premium": combined
+                })
+                
+                # Add to Chart Data (Tracking Combined Premiums)
+                chart_updates[f"{sd_level} Premium"] = combined
 
-        # Update Session Log (Keep only last 10 rows for memory efficiency)
-        st.session_state['logs'].append(new_log)
-        if len(st.session_state['logs']) > 10:
-            st.session_state['logs'].pop(0)
+            # E. Update UI
+            with col_spot:
+                st.metric("Spot Price", spot_price)
+            with col_straddle:
+                st.metric("ATM Straddle", f"{straddle_price:.2f}", delta=None)
 
-        # Update Metrics (Instant visual update)
-        spot_display.metric("SPOT PRICE", my_ltp)
-        ce_display.metric("CE STRIKE", my_ce_strike)
-        pe_display.metric("PE STRIKE", my_pe_strike)
-        pnl_display.metric("TOTAL P&L", f"₹ {my_pnl}")
+            # Update History for Chart
+            new_row = pd.DataFrame([chart_updates])
+            if not new_row.empty:
+                st.session_state['history'][index_name] = pd.concat(
+                    [st.session_state['history'][index_name], new_row]
+                ).tail(100) # Keep last 100 points to save RAM
+            
+            # Render Table
+            df_display = pd.DataFrame(display_rows)
+            table_container.dataframe(df_display, use_container_width=True, hide_index=True)
+            
+            # Render Line Chart
+            chart_df = st.session_state['history'][index_name].set_index("Time")
+            chart_container.line_chart(chart_df)
 
-        # Update Table
-        df_logs = pd.DataFrame(st.session_state['logs'])
-        # Sort so newest is on top
-        log_table.dataframe(df_logs.iloc[::-1], use_container_width=True, hide_index=True)
+    else:
+        st.info("Waiting for Token & Start...")
 
-        # Sleep to prevent CPU spike
-        time.sleep(refresh_rate)
+# --- 6. RENDER ALL TABS ---
 
-else:
-    st.info("System is Offline. Press START in Sidebar.")
+with tab1:
+    render_index_tab("NIFTY")
+    
+with tab2:
+    render_index_tab("BANKNIFTY")
+
+with tab3:
+    render_index_tab("SENSEX")
+
+# Loop Trigger (Simulates Live Feed in Streamlit)
+if run_engine:
+    time.sleep(refresh_rate)
+    st.rerun()
