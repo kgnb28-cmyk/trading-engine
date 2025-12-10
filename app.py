@@ -2,13 +2,16 @@ import streamlit as st
 import pandas as pd
 import time
 import requests
+import os
 import random
 from datetime import datetime, date
 
-# --- 1. CONFIGURATION ---
+# ==========================================
+# 1. CONFIGURATION & STYLES
+# ==========================================
 st.set_page_config(page_title="Straddle Terminal", layout="wide", page_icon="⚡")
 
-# Professional UI CSS (StraddleChart Clone)
+# Professional UI CSS
 st.markdown("""
     <style>
         .block-container {padding-top: 1rem; padding-bottom: 2rem;}
@@ -23,187 +26,233 @@ st.markdown("""
         .metric-value { font-size: 22px; color: #fff; font-weight: 700; }
         .highlight-green { color: #00e676; }
         .highlight-yellow { color: #ffea00; }
-        .debug-box { font-family: monospace; font-size: 12px; color: #ff4b4b; background: #111; padding: 10px; border-radius: 5px; }
+        .error-box { color: #ff4b4b; background: #290000; padding: 10px; border-radius: 5px; border: 1px solid #ff4b4b; }
     </style>
 """, unsafe_allow_html=True)
 
-# --- 2. GLOBAL SETTINGS ---
+# ==========================================
+# 2. GLOBAL SETTINGS & DATA LOADING
+# ==========================================
+
+# ✅ CORRECTED KEYS (Title Case for Sensex is critical)
 INDICES = {
-    "NIFTY": {"key": "NSE_INDEX|Nifty 50", "step": 50},
-    "BANKNIFTY": {"key": "NSE_INDEX|Nifty Bank", "step": 100},
-    "SENSEX": {"key": "BSE_INDEX|SENSEX", "step": 100},
+    "NIFTY": {"key": "NSE_INDEX|Nifty 50", "step": 50, "segment": "NSE_FO"},
+    "BANKNIFTY": {"key": "NSE_INDEX|Nifty Bank", "step": 100, "segment": "NSE_FO"},
+    "SENSEX": {"key": "BSE_INDEX|Sensex", "step": 100, "segment": "BSE_FO"}, 
+    "BANKEX": {"key": "BSE_INDEX|BANKEX", "step": 100, "segment": "BSE_FO"}
 }
 
+@st.cache_resource
+def load_master_contract():
+    """Loads the mini_master.json file."""
+    # Looks for file in the same directory as this script
+    file_path = "mini_master.json"
+    
+    if not os.path.exists(file_path):
+        return None
+    try:
+        df = pd.read_json(file_path)
+        return df
+    except Exception as e:
+        st.error(f"Error reading mini_master.json: {e}")
+        return None
+
+# Load Data on Startup
+MASTER_DF = load_master_contract()
+
 if 'chart_store' not in st.session_state:
-    st.session_state['chart_store'] = {} 
+    st.session_state['chart_store'] = {}
 
-# --- 3. DATA ENGINE ---
+# ==========================================
+# 3. CORE LOGIC ENGINE
+# ==========================================
 
-def get_upstox_fmt(d):
-    # Converts 16 Dec 2025 -> 16DEC25
-    return d.strftime("%d%b%y").upper()
+def find_instrument_key(index_name, expiry_date, strike, option_type):
+    """
+    Finds the specific instrument_key from mini_master.json
+    """
+    if MASTER_DF is None:
+        return None, "Master File Missing (mini_master.json)"
 
-def construct_symbol(index, expiry, strike, type_):
-    exch = "BSE_FO" if index == "SENSEX" else "NSE_FO"
-    return f"{exch}|{index}{expiry}{strike}{type_}"
+    cfg = INDICES[index_name]
+    segment = cfg["segment"]
+    
+    # Adjust search name if needed
+    search_name = index_name 
+    if index_name == "NIFTY": search_name = "NIFTY" 
+    if index_name == "SENSEX": search_name = "SENSEX"
 
-def fetch_live_data(token, symbols):
+    try:
+        # Convert date to string format common in Upstox JSON (YYYY-MM-DD)
+        exp_str = expiry_date.strftime("%Y-%m-%d")
+
+        mask = (
+            (MASTER_DF['segment'] == segment) &
+            (MASTER_DF['name'] == search_name) &
+            (MASTER_DF['strike_price'] == strike) &
+            (MASTER_DF['instrument_type'] == option_type) &
+            (MASTER_DF['expiry'].astype(str).str.contains(exp_str))
+        )
+        
+        result = MASTER_DF[mask]
+        
+        if not result.empty:
+            return result.iloc[0]['instrument_key'], "OK"
+        else:
+            return None, f"Not Found: {index_name} {strike} {option_type}"
+            
+    except Exception as e:
+        return None, f"Lookup Error: {str(e)}"
+
+def fetch_live_data(token, instrument_keys):
+    """Fetches LTP for a list of instrument keys."""
     if not token: return {}, "No Token"
+    
     url = "https://api.upstox.com/v2/market-quote/ltp"
     headers = {'Authorization': f'Bearer {token}', 'Accept': 'application/json'}
     
     try:
-        # Request Data
-        resp = requests.get(url, headers=headers, params={'instrument_key': ",".join(symbols)}, timeout=2)
+        params = {'instrument_key': ",".join(instrument_keys)}
+        resp = requests.get(url, headers=headers, params=params, timeout=3)
         
         if resp.status_code == 200:
-            d = resp.json().get('data', {})
-            # Return Data and Success Message
-            return {k: v['last_price'] for k, v in d.items()}, "OK"
+            data = resp.json().get('data', {})
+            # Return Dict: {instrument_key: price}
+            return {k: v['last_price'] for k, v in data.items()}, "OK"
         else:
-            # Return Error Code
-            return {}, f"API Error {resp.status_code}: {resp.text}"
+            return {}, f"API {resp.status_code}: {resp.text}"
     except Exception as e:
-        return {}, f"Connection Error: {str(e)}"
+        return {}, f"Conn Err: {str(e)}"
 
 def run_strategy_logic(token, index, expiry_date, use_sim=False):
-    """
-    Returns: (Spot, ATM, Straddle, Row, ErrorMsg, DebugInfo)
-    """
+    debug_log = []
     cfg = INDICES[index]
-    exp_tag = get_upstox_fmt(expiry_date)
-    debug_log = [] # To store details for the Debug Panel
     
-    # --- SIMULATION (For Testing) ---
+    # --- SIMULATION ---
     if use_sim:
-        base = 24500 if index == "NIFTY" else 52000
+        base = 24500 if index == "NIFTY" else 80000
         spot = base + random.randint(-50, 50)
         atm = round(spot / cfg['step']) * cfg['step']
-        straddle = 200 + random.randint(-5, 5)
-        row = {
-            "Time": datetime.now().strftime("%H:%M:%S"),
-            "ATM Straddle": straddle,
-            "1.0 SD": straddle * 0.8, "1.5 SD": straddle * 0.6, "2.0 SD": straddle * 0.4
-        }
-        return spot, atm, straddle, row, None, ["Simulation Active"]
+        straddle = 300 + random.randint(-10, 10)
+        row = {"Time": datetime.now().strftime("%H:%M:%S"), "ATM Straddle": straddle}
+        return spot, atm, straddle, row, None, ["Simulation Mode"]
 
-    # --- REAL LIVE DATA ---
+    # --- REAL DATA ---
     
-    # 1. Fetch Spot
-    spot_data, status = fetch_live_data(token, [cfg['key']])
-    spot_price = spot_data.get(cfg['key'])
+    # 1. Fetch Spot Price
+    spot_key = cfg['key']
+    spot_res, msg = fetch_live_data(token, [spot_key])
+    spot_price = spot_res.get(spot_key)
     
-    debug_log.append(f"1. Spot Request: {cfg['key']}")
-    debug_log.append(f"   Result: {spot_price} (Status: {status})")
-
-    if spot_price is None:
-        return 0, 0, 0, None, "Spot Data Missing", debug_log
+    debug_log.append(f"1. Spot Request: {spot_key}")
+    debug_log.append(f"   Result: {spot_price} ({msg})")
+    
+    if not spot_price:
+        return 0, 0, 0, None, f"Spot Data Missing. Check Token.", debug_log
 
     # 2. Calculate ATM
     atm_strike = round(spot_price / cfg['step']) * cfg['step']
     
-    # 3. Fetch ATM Straddle
-    ce_sym = construct_symbol(index, exp_tag, atm_strike, "CE")
-    pe_sym = construct_symbol(index, exp_tag, atm_strike, "PE")
+    # 3. Lookup Option Keys (CE & PE)
+    ce_key, ce_err = find_instrument_key(index, expiry_date, atm_strike, "CE")
+    pe_key, pe_err = find_instrument_key(index, expiry_date, atm_strike, "PE")
     
-    atm_res, status_opt = fetch_live_data(token, [ce_sym, pe_sym])
-    c_ltp = atm_res.get(ce_sym)
-    p_ltp = atm_res.get(pe_sym)
+    debug_log.append(f"2. Option Keys: CE={ce_key} | PE={pe_key}")
     
-    debug_log.append(f"2. Option Request: {ce_sym} & {pe_sym}")
-    debug_log.append(f"   Result: CE={c_ltp}, PE={p_ltp}")
-    
-    if c_ltp is None or p_ltp is None:
-        return spot_price, atm_strike, 0, None, "Invalid Symbol/Expiry", debug_log
+    if not ce_key or not pe_key:
+        return spot_price, atm_strike, 0, None, f"Key Lookup Failed: {ce_err or pe_err}", debug_log
         
-    atm_prem = c_ltp + p_ltp
+    # 4. Fetch Option Prices
+    opt_res, opt_msg = fetch_live_data(token, [ce_key, pe_key])
+    ce_ltp = opt_res.get(ce_key)
+    pe_ltp = opt_res.get(pe_key)
     
-    # 4. Fetch SD Levels
-    sd_val = atm_prem
-    strikes = {
-        "ATM Straddle": {"c": atm_strike, "p": atm_strike},
-        "1.0 SD": {"c": round((spot_price + sd_val)/cfg['step'])*cfg['step'], "p": round((spot_price - sd_val)/cfg['step'])*cfg['step']},
-        "1.5 SD": {"c": round((spot_price + sd_val*1.5)/cfg['step'])*cfg['step'], "p": round((spot_price - sd_val*1.5)/cfg['step'])*cfg['step']},
-        "2.0 SD": {"c": round((spot_price + sd_val*2.0)/cfg['step'])*cfg['step'], "p": round((spot_price - sd_val*2.0)/cfg['step'])*cfg['step']}
+    debug_log.append(f"3. Option Prices: CE={ce_ltp} | PE={pe_ltp}")
+    
+    if ce_ltp is None or pe_ltp is None:
+        return spot_price, atm_strike, 0, None, "Option Prices Missing", debug_log
+        
+    straddle_price = ce_ltp + pe_ltp
+    
+    # 5. Build Chart Data
+    row = {
+        "Time": datetime.now().strftime("%H:%M:%S"),
+        "ATM Straddle": straddle_price
     }
     
-    all_syms = []
-    for s in strikes.values():
-        all_syms.append(construct_symbol(index, exp_tag, s['c'], "CE"))
-        all_syms.append(construct_symbol(index, exp_tag, s['p'], "PE"))
-        
-    all_data, _ = fetch_live_data(token, all_syms)
-    
-    row = {"Time": datetime.now().strftime("%H:%M:%S")}
-    for name, s in strikes.items():
-        c = construct_symbol(index, exp_tag, s['c'], "CE")
-        p = construct_symbol(index, exp_tag, s['p'], "PE")
-        v_c = all_data.get(c, 0) or 0
-        v_p = all_data.get(p, 0) or 0
-        row[name] = v_c + v_p
-        
-    return spot_price, atm_strike, atm_prem, row, None, debug_log
+    return spot_price, atm_strike, straddle_price, row, None, debug_log
 
-# --- 4. COMPONENT: PANEL RENDER ---
+# ==========================================
+# 4. COMPONENT: PANEL RENDER
+# ==========================================
 def render_panel(panel_id, default_idx):
     with st.container(border=True):
         
-        # Header Controls
+        # Header
         c1, c2, c3 = st.columns([2, 2, 4])
-        with c1: sel_idx = st.selectbox("Index", list(INDICES.keys()), index=list(INDICES.keys()).index(default_idx), key=f"i_{panel_id}", label_visibility="collapsed")
-        with c2: sel_date = st.date_input("Expiry", min_value=date.today(), key=f"d_{panel_id}", label_visibility="collapsed")
-        with c3: st.caption(f"LIVE • {get_upstox_fmt(sel_date)}")
+        with c1: 
+            sel_idx = st.selectbox("Index", list(INDICES.keys()), index=list(INDICES.keys()).index(default_idx), key=f"i_{panel_id}", label_visibility="collapsed")
+        with c2: 
+            sel_date = st.date_input("Expiry", min_value=date.today(), key=f"d_{panel_id}", label_visibility="collapsed")
+        with c3: 
+            st.caption(f"LIVE • {sel_date.strftime('%d-%b-%Y')}")
+
+        # Check for Master File
+        if MASTER_DF is None:
+            st.error("❌ 'mini_master.json' not found. Please run the shrink script and place the file here.")
+            return
 
         # Execution
         spot, atm, straddle, row, err, debug_info = run_strategy_logic(token, sel_idx, sel_date, use_sim=is_sim)
         
-        # Visuals
+        # Display
         if err:
-            st.error(f"⚠️ {err}")
-            # DEBUG EXPANDER (Only shows if there is an error)
-            with st.expander("🔍 Debug: Why did this fail?"):
-                st.write(f"**Generated Expiry Tag:** {get_upstox_fmt(sel_date)}")
-                for log in debug_info:
-                    st.text(log)
-                st.info("Check if the Date selected matches the exact Expiry Date of the contract.")
+            st.markdown(f'<div class="error-box">⚠️ {err}</div>', unsafe_allow_html=True)
+            with st.expander("🔍 Debug Logs"):
+                for line in debug_info: st.text(line)
         else:
-            # Stats Deck
+            # Stats Grid
             k1, k2, k3, k4 = st.columns(4)
             dte = (sel_date - date.today()).days
             k1.markdown(f'<div class="metric-card"><div class="metric-label">DTE</div><div class="metric-value">{dte}</div></div>', unsafe_allow_html=True)
             k2.markdown(f'<div class="metric-card"><div class="metric-label">SPOT</div><div class="metric-value">{spot}</div></div>', unsafe_allow_html=True)
             k3.markdown(f'<div class="metric-card"><div class="metric-label">ATM</div><div class="metric-value highlight-yellow">{atm}</div></div>', unsafe_allow_html=True)
-            k4.markdown(f'<div class="metric-card"><div class="metric-label">STRADDLE</div><div class="metric-value highlight-green">{straddle:.2f}</div></div>', unsafe_allow_html=True)
-
-            # Chart Logic
-            key = f"data_{panel_id}"
-            if key not in st.session_state['chart_store']: st.session_state['chart_store'][key] = pd.DataFrame()
-            if row:
-                st.session_state['chart_store'][key] = pd.concat([st.session_state['chart_store'][key], pd.DataFrame([row])], ignore_index=True).tail(300)
+            k4.markdown(f'<div class="metric-card"><div class="metric-label">PREMIUM</div><div class="metric-value highlight-green">{straddle:.2f}</div></div>', unsafe_allow_html=True)
             
-            # Draw Chart
-            st.line_chart(st.session_state['chart_store'][key].set_index("Time"), height=400, color=["#ffffff", "#ffff00", "#ffa500", "#ff4b4b"])
+            # Charting
+            key = f"data_{panel_id}"
+            if key not in st.session_state['chart_store']: 
+                st.session_state['chart_store'][key] = pd.DataFrame()
+            
+            if row:
+                st.session_state['chart_store'][key] = pd.concat([st.session_state['chart_store'][key], pd.DataFrame([row])], ignore_index=True).tail(100)
+            
+            chart_df = st.session_state['chart_store'][key]
+            if not chart_df.empty:
+                st.line_chart(chart_df.set_index("Time"), height=350, color=["#00e676"])
 
-# --- 5. MAIN LAYOUT ---
+# ==========================================
+# 5. MAIN LAYOUT & SIDEBAR
+# ==========================================
 with st.sidebar:
-    st.header("🔐 Auth")
-    token = st.text_input("Token", type="password", placeholder="Paste Upstox Token", label_visibility="collapsed")
+    st.header("⚡ Settings")
+    token = st.text_input("API Token", type="password", placeholder="Paste access token here")
     st.divider()
     is_sim = st.toggle("🛠 Simulation Mode", value=False)
-    view_mode = st.radio("View", ["Single Panel", "Dual Panel"])
+    view_mode = st.radio("Layout", ["Single Panel", "Dual Panel"])
     st.divider()
-    active = st.toggle("ACTIVATE FEED", value=False)
-    if st.button("Clear History"): st.session_state['chart_store'] = {}
+    active = st.toggle("🔴 ACTIVATE FEED", value=False)
+    if st.button("🗑️ Clear Charts"): st.session_state['chart_store'] = {}
 
-# Layout
+# Layout Logic
 if view_mode == "Single Panel":
-    render_panel("p1", "NIFTY")
+    render_panel("p1", "SENSEX")
 else:
     c_left, c_right = st.columns(2)
     with c_left: render_panel("p1", "NIFTY")
     with c_right: render_panel("p2", "SENSEX")
 
-# Loop
+# Auto-Refresh Loop
 if active:
     time.sleep(2)
     st.rerun()
