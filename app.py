@@ -209,7 +209,7 @@ def fetch_market_data(access_token, symbol, expiry_date):
 
 # Sidebar
 with st.sidebar:
-    st.header("KYOTO CONFIG")
+    st.header("KYOTO CAPITAL")
     ACCESS_TOKEN = st.text_input("API Token", type="password")
     symbol = st.selectbox("Instrument", ["NIFTY", "BANKNIFTY"])
     
