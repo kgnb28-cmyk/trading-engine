@@ -1,132 +1,104 @@
 import streamlit as st
+import requests
 import pandas as pd
 import plotly.graph_objects as go
 from datetime import datetime
-import backtest  # Importing your backtest logic module
 
-# --- Page Configuration ---
-st.set_page_config(
-    page_title="Kyoto Capital | Backtest Engine",
-    page_icon="📈",
-    layout="wide"
-)
+# --- CONFIGURATION ---
+st.set_page_config(page_title="Kyoto Capital | Live Dashboard", layout="wide")
 
-st.title("📈 Kyoto Capital: Algo Backtesting Dashboard")
+# 🔴 PASTE YOUR UPSTOX ACCESS TOKEN HERE
+ACCESS_TOKEN = "eyJ0eXAiOiJKV1QiLCJrZXlfaWQiOiJza192MS4wIiwiYWxnIjoiSFMyNTYifQ.eyJzdWIiOiIyNUNHNDIiLCJqdGkiOiI2OTM4ZmZkNmYwYjE5MTAyZjYyZDI2M2EiLCJpc011bHRpQ2xpZW50IjpmYWxzZSwiaXNQbHVzUGxhbiI6dHJ1ZSwiaWF0IjoxNzY1MzQzMTkwLCJpc3MiOiJ1ZGFwaS1nYXRld2F5LXNlcnZpY2UiLCJleHAiOjE3NjU0MDQwMDB9.tK0D-HKXccX_0aboTIzggYTOTxrNtjlIjyX0BVmLB4Y" 
+
+# ✅ THE VERIFIED MAPPING (Golden Keys)
+INSTRUMENT_MAPPING = {
+    "NIFTY": "NSE_INDEX|Nifty 50",
+    "BANKNIFTY": "NSE_INDEX|Nifty Bank"
+}
+
+# --- FUNCTIONS ---
+
+def get_live_price(instrument_key):
+    """
+    Fetches live price from Upstox V2.
+    Handles the tricky logic where Request uses '|' but Response uses ':'
+    """
+    url = "https://api.upstox.com/v2/market-quote/ltp"
+    headers = {
+        'Accept': 'application/json',
+        'Authorization': f'Bearer {ACCESS_TOKEN}'
+    }
+    params = {'instrument_key': instrument_key}
+    
+    try:
+        response = requests.get(url, headers=headers, params=params)
+        data = response.json()
+        
+        # DEBUG: Print raw response to terminal to see what's happening
+        print(f"DEBUG Response for {instrument_key}: {data}")
+
+        if response.status_code == 200 and data.get("status") == "success":
+            # ⚠️ CRITICAL FIX: Upstox response keys use ':' instead of '|'
+            # We convert 'NSE_INDEX|Nifty 50' -> 'NSE_INDEX:Nifty 50' to find the data
+            response_key = instrument_key.replace('|', ':')
+            
+            # Fetch the specific instrument data
+            instrument_data = data['data'].get(response_key)
+            
+            if instrument_data:
+                return instrument_data['last_price']
+            else:
+                st.error(f"Key mismatch! API returned data but could not find key: {response_key}")
+                return None
+        else:
+            st.error(f"API Error: {data.get('message', 'Unknown Error')}")
+            return None
+            
+    except Exception as e:
+        st.error(f"Connection Error: {e}")
+        return None
+
+# --- UI LAYOUT ---
+
+st.title("📈 Kyoto Capital: Live Algo Dashboard")
 st.markdown("---")
 
-# --- Sidebar: Configuration ---
+# Sidebar
 with st.sidebar:
-    st.header("Settings")
-    uploaded_file = st.file_uploader("Upload Tick/OHLC Data (CSV)", type=['csv'])
+    st.header("Live Configuration")
+    selected_symbol = st.selectbox("Select Instrument", list(INSTRUMENT_MAPPING.keys()))
     
-    st.subheader("Strategy Parameters")
-    # Example parameters - adjust based on your specific strategy inputs
-    param1 = st.number_input("Parameter 1 (e.g., Window)", min_value=1, value=14)
-    param2 = st.number_input("Parameter 2 (e.g., Threshold)", min_value=0.0, value=1.5)
+    # Get the correct key for the API
+    api_instrument_key = INSTRUMENT_MAPPING[selected_symbol]
     
-    run_btn = st.button("Run Backtest", type="primary")
+    st.info(f"API Key: {api_instrument_key}")
+    
+    if st.button("Refresh Data"):
+        st.rerun()
 
-# --- Main Logic ---
-if run_btn and uploaded_file is not None:
-    try:
-        # 1. Load Data
-        df = pd.read_csv(uploaded_file)
-        st.success(f"Loaded data with {len(df)} rows.")
+# Main Area
+st.subheader(f"Live Spot Data: {selected_symbol}")
 
-        # 2. Run Backtest
-        # We pass the dataframe and params to your backtest module
-        with st.spinner("Running Strategy..."):
-            # Ensure your backtest.run_backtest function accepts these arguments
-            results, signals, trade_log = backtest.run_backtest(df, param1, param2)
+# 1. Fetch Data
+current_price = get_live_price(api_instrument_key)
 
-        # 3. Display Metrics
-        col1, col2, col3, col4 = st.columns(4)
-        col1.metric("Total Return", f"{results.get('total_return', 0):.2f}%")
-        col2.metric("Win Rate", f"{results.get('win_rate', 0):.2f}%")
-        col3.metric("Max Drawdown", f"{results.get('max_drawdown', 0):.2f}%")
-        col4.metric("Total Trades", results.get('total_trades', 0))
+# 2. Display Data or Error
+if current_price:
+    # Success Display
+    col1, col2 = st.columns(2)
+    col1.metric(label=f"{selected_symbol} Spot Price", value=f"₹{current_price}")
+    col2.success("Connected to Upstox V2")
+    
+    # Debug Logs (Expandable)
+    with st.expander("🔍 Debug Logs (Connection Details)"):
+        st.write(f"1. User Selected: {selected_symbol}")
+        st.write(f"2. Sending Key to API: `{api_instrument_key}`")
+        st.write(f"3. Searching Response for Key: `{api_instrument_key.replace('|', ':')}`")
+        st.write(f"4. Price Found: {current_price}")
 
-        # 4. Visualization (The Fix for KeyError is here)
-        st.subheader("Trade Signals Analysis")
-        
-        # Prepare data for plotting
-        # We map the signals to the dataframe index for plotting
-        buy_signals = []
-        sell_signals = []
-        
-        # --- CRITICAL FIX: Robust Key Handling ---
-        # The loop checks if the key exists as an integer OR a string
-        for i in df.index:
-            # Try accessing with integer index first, then string index
-            signal_data = signals.get(i) or signals.get(str(i))
-            
-            if signal_data == 'BUY':
-                buy_signals.append(df.iloc[i]['Close']) # Assuming 'Close' column exists
-                sell_signals.append(None)
-            elif signal_data == 'SELL':
-                buy_signals.append(None)
-                sell_signals.append(df.iloc[i]['Close'])
-            else:
-                buy_signals.append(None)
-                sell_signals.append(None)
-
-        # Add columns to DF for easier plotting
-        df['Buy_Signal'] = buy_signals
-        df['Sell_Signal'] = sell_signals
-
-        # Plotting with Plotly
-        fig = go.Figure()
-
-        # Candlestick (if OHLC data exists) or Line Chart
-        if set(['Open', 'High', 'Low', 'Close']).issubset(df.columns):
-            fig.add_trace(go.Candlestick(x=df.index,
-                            open=df['Open'], high=df['High'],
-                            low=df['Low'], close=df['Close'],
-                            name='Price'))
-        else:
-            fig.add_trace(go.Scatter(x=df.index, y=df['Close'], mode='lines', name='Price'))
-
-        # Add Buy Markers
-        fig.add_trace(go.Scatter(
-            x=df.index, 
-            y=df['Buy_Signal'],
-            mode='markers',
-            marker=dict(symbol='triangle-up', color='green', size=10),
-            name='Buy Signal'
-        ))
-
-        # Add Sell Markers
-        fig.add_trace(go.Scatter(
-            x=df.index, 
-            y=df['Sell_Signal'],
-            mode='markers',
-            marker=dict(symbol='triangle-down', color='red', size=10),
-            name='Sell Signal'
-        ))
-
-        fig.update_layout(
-            title='Price Action with Trade Signals',
-            xaxis_title='Index/Time',
-            yaxis_title='Price',
-            template='plotly_dark',
-            height=600
-        )
-        
-        st.plotly_chart(fig, use_container_width=True)
-
-        # 5. Trade Log Table
-        st.subheader("Trade Logs")
-        if trade_log:
-            log_df = pd.DataFrame(trade_log)
-            st.dataframe(log_df, use_container_width=True)
-        else:
-            st.info("No trades generated.")
-
-    except Exception as e:
-        st.error(f"An error occurred during execution: {e}")
-        # Print detailed traceback to terminal for debugging
-        import traceback
-        traceback.print_exc()
-
-elif run_btn and uploaded_file is None:
-    st.warning("Please upload a CSV file first.")
+else:
+    # Error Display
+    st.warning("⚠️ Spot Data Missing. Check Token or API Limits.")
+    with st.expander("🔍 Debug Logs"):
+        st.write(f"Requesting Key: {api_instrument_key}")
+        st.write("Result: None (Error in fetching)")
