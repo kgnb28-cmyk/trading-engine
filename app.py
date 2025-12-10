@@ -111,12 +111,11 @@ def fetch_market_data(access_token, symbol, expiry_date):
             return None, f"ATM {atm_strike} not in chain"
 
         # 5. SD LOGIC (Width = ATM Premium)
-        # ATM Straddle Premium (CE + PE)
         atm_premium = strike_map[atm_strike]['CE_LTP'] + strike_map[atm_strike]['PE_LTP']
         
         # Calculate Distances (Rounded to nearest step)
         width_1sd = round_to_strike(atm_premium, step)
-        width_15sd = round_to_strike(atm_premium * 1.5, step) # 1.5 SD Logic Added
+        width_15sd = round_to_strike(atm_premium * 1.5, step)
         width_2sd = round_to_strike(atm_premium * 2.0, step)
 
         # Helper for Strangle Sum
@@ -145,50 +144,51 @@ def fetch_market_data(access_token, symbol, expiry_date):
 
 # --- 3. UI HELPER: THE CHART RENDERER ---
 
-def render_chart(container, history_df, data_metrics):
+def render_chart(history_df, data_metrics):
     """
-    Draws the chart inside a specific container (Window A or B).
+    Draws metrics and chart. 
+    NOTE: This function does NOT create a container. 
+    It renders into whatever context is active (Window A or B).
     """
-    with container:
-        # Metrics Row
-        m1, m2, m3, m4 = st.columns(4)
-        m1.metric("Spot", f"{data_metrics['spot']}")
-        m2.metric("ATM Straddle", f"₹{data_metrics['atm_straddle']:.0f}")
-        m3.metric("1SD Width", f"{data_metrics['desc_1sd']}")
-        m4.metric("1.5SD Val", f"₹{data_metrics['1.5sd_val']:.0f}")
+    # Metrics Row
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("Spot", f"{data_metrics['spot']}")
+    m2.metric("ATM Straddle", f"₹{data_metrics['atm_straddle']:.0f}")
+    m3.metric("1SD Width", f"{data_metrics['desc_1sd']}")
+    m4.metric("1.5SD Val", f"₹{data_metrics['1.5sd_val']:.0f}")
 
-        # Plotly Chart
-        fig = go.Figure()
-        
-        # ATM (Cyan)
-        fig.add_trace(go.Scatter(
-            x=history_df['Time'], y=history_df['ATM'],
-            mode='lines', name='ATM', line=dict(color='#22D3EE', width=3)
-        ))
-        # 1SD (Green)
-        fig.add_trace(go.Scatter(
-            x=history_df['Time'], y=history_df['1SD'],
-            mode='lines', name='1SD', line=dict(color='#4ADE80', width=2)
-        ))
-        # 1.5SD (Yellow) - NEW
-        fig.add_trace(go.Scatter(
-            x=history_df['Time'], y=history_df['1.5SD'],
-            mode='lines', name='1.5SD', line=dict(color='#FACC15', width=2)
-        ))
-        # 2SD (Pink)
-        fig.add_trace(go.Scatter(
-            x=history_df['Time'], y=history_df['2SD'],
-            mode='lines', name='2SD', line=dict(color='#F472B6', width=2)
-        ))
+    # Plotly Chart
+    fig = go.Figure()
+    
+    # ATM (Cyan)
+    fig.add_trace(go.Scatter(
+        x=history_df['Time'], y=history_df['ATM'],
+        mode='lines', name='ATM', line=dict(color='#22D3EE', width=3)
+    ))
+    # 1SD (Green)
+    fig.add_trace(go.Scatter(
+        x=history_df['Time'], y=history_df['1SD'],
+        mode='lines', name='1SD', line=dict(color='#4ADE80', width=2)
+    ))
+    # 1.5SD (Yellow)
+    fig.add_trace(go.Scatter(
+        x=history_df['Time'], y=history_df['1.5SD'],
+        mode='lines', name='1.5SD', line=dict(color='#FACC15', width=2)
+    ))
+    # 2SD (Pink)
+    fig.add_trace(go.Scatter(
+        x=history_df['Time'], y=history_df['2SD'],
+        mode='lines', name='2SD', line=dict(color='#F472B6', width=2)
+    ))
 
-        fig.update_layout(
-            paper_bgcolor='#1E293B', plot_bgcolor='#0F172A',
-            font=dict(family="Lato", color="#94A3B8"),
-            xaxis=dict(showgrid=False), yaxis=dict(showgrid=True, gridcolor='#334155'),
-            margin=dict(l=10, r=10, t=10, b=10), height=350,
-            showlegend=True, legend=dict(orientation="h", y=1.1)
-        )
-        st.plotly_chart(fig, use_container_width=True)
+    fig.update_layout(
+        paper_bgcolor='#1E293B', plot_bgcolor='#0F172A',
+        font=dict(family="Lato", color="#94A3B8"),
+        xaxis=dict(showgrid=False), yaxis=dict(showgrid=True, gridcolor='#334155'),
+        margin=dict(l=10, r=10, t=10, b=10), height=350,
+        showlegend=True, legend=dict(orientation="h", y=1.1)
+    )
+    st.plotly_chart(fig, use_container_width=True)
 
 # --- 4. MAIN APP LAYOUT (WIDGETS OUTSIDE LOOP) ---
 
@@ -227,7 +227,7 @@ st.title("♟️ KYOTO: MULTI-STRATEGY ENGINE")
 if 'hist_a' not in st.session_state: st.session_state.hist_a = pd.DataFrame(columns=['Time', 'ATM', '1SD', '1.5SD', '2SD'])
 if 'hist_b' not in st.session_state: st.session_state.hist_b = pd.DataFrame(columns=['Time', 'ATM', '1SD', '1.5SD', '2SD'])
 
-# Track Last Symbol to prevent SPIKES (The Fix for Issue B)
+# Track Last Symbol to prevent SPIKES
 if 'last_sym_a' not in st.session_state: st.session_state.last_sym_a = sym_a
 if 'last_sym_b' not in st.session_state: st.session_state.last_sym_b = sym_b
 
@@ -243,8 +243,7 @@ if sym_b and st.session_state.last_sym_b != sym_b:
 
 # --- 6. EXECUTION LOOP ---
 
-# Create Placeholders (Containers) for the charts
-# This ensures we update the SAME area, not create duplicates
+# Create Placeholders (Containers)
 if view_mode == "Single Window":
     container_a = st.empty()
     container_b = None
@@ -274,9 +273,9 @@ def update_dashboard():
         }])
         st.session_state.hist_a = pd.concat([st.session_state.hist_a, new_row], ignore_index=True).tail(50)
         
-        # Render A
+        # Render A -> We activate the container HERE
         with container_a.container():
-            render_chart(st, st.session_state.hist_a, data_a)
+            render_chart(st.session_state.hist_a, data_a)
     elif err_a:
         container_a.error(err_a)
 
@@ -294,9 +293,9 @@ def update_dashboard():
             }])
             st.session_state.hist_b = pd.concat([st.session_state.hist_b, new_row], ignore_index=True).tail(50)
             
-            # Render B
+            # Render B -> We activate the container HERE
             with container_b.container():
-                render_chart(st, st.session_state.hist_b, data_b)
+                render_chart(st.session_state.hist_b, data_b)
         elif err_b:
             container_b.error(err_b)
 
