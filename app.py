@@ -7,7 +7,7 @@ import time
 
 # --- 1. KYOTO CAPITAL: CONFIG & STYLING ---
 st.set_page_config(
-    page_title="Kyoto Capital | Multi-Strategy Engine",
+    page_title="Kyoto Capital | Multi-Straddle Engine",
     page_icon="♟️",
     layout="wide"
 )
@@ -51,7 +51,9 @@ def round_to_strike(price, step):
 
 def fetch_market_data(access_token, symbol, expiry_date):
     """
-    Fetches Spot -> Calculates ATM -> Returns 1SD, 1.5SD, 2SD Premiums
+    New Logic: 
+    1. Fetch Spot & ATM Straddle.
+    2. Calculate SD values using multipliers (0.33, 0.2, 0.15).
     """
     # 1. DEFINE MAPPINGS
     if symbol == "NIFTY":
@@ -77,7 +79,6 @@ def fetch_market_data(access_token, symbol, expiry_date):
         if spot_data.get('status') != 'success':
             return None, "Spot Fetch Failed"
         
-        # Handle | vs : swap
         spot_val = spot_data['data'][spot_key.replace('|', ':')]['last_price']
         
     except Exception as e:
@@ -86,7 +87,7 @@ def fetch_market_data(access_token, symbol, expiry_date):
     # 3. Calculate ATM Strike
     atm_strike = round_to_strike(spot_val, step)
 
-    # 4. Fetch Option Chain
+    # 4. Fetch Option Chain (Only to get ATM Straddle Premium)
     try:
         url_chain = "https://api.upstox.com/v2/option/chain"
         params_chain = {'instrument_key': spot_key, 'expiry_date': expiry_date}
@@ -98,45 +99,36 @@ def fetch_market_data(access_token, symbol, expiry_date):
             
         options_list = chain_data['data']
         
-        # Map Strikes for fast lookup
-        strike_map = {} 
+        # Find ATM Premiums
+        atm_ce = 0
+        atm_pe = 0
+        found = False
+
         for item in options_list:
-            strike = item['strike_price']
-            strike_map[strike] = {
-                'CE_LTP': item['call_options']['market_data']['ltp'],
-                'PE_LTP': item['put_options']['market_data']['ltp']
-            }
-
-        if atm_strike not in strike_map:
-            return None, f"ATM {atm_strike} not in chain"
-
-        # 5. SD LOGIC (Width = ATM Premium)
-        atm_premium = strike_map[atm_strike]['CE_LTP'] + strike_map[atm_strike]['PE_LTP']
+            if item['strike_price'] == atm_strike:
+                atm_ce = item['call_options']['market_data']['ltp']
+                atm_pe = item['put_options']['market_data']['ltp']
+                found = True
+                break
         
-        # Calculate Distances (Rounded to nearest step)
-        width_1sd = round_to_strike(atm_premium, step)
-        width_15sd = round_to_strike(atm_premium * 1.5, step)
-        width_2sd = round_to_strike(atm_premium * 2.0, step)
+        if not found:
+            return None, f"ATM {atm_strike} not found"
 
-        # Helper for Strangle Sum
-        def get_strangle(upper, lower):
-            if upper in strike_map and lower in strike_map:
-                return strike_map[upper]['CE_LTP'] + strike_map[lower]['PE_LTP']
-            return 0
-
-        val_1sd = get_strangle(atm_strike + width_1sd, atm_strike - width_1sd)
-        val_15sd = get_strangle(atm_strike + width_15sd, atm_strike - width_15sd)
-        val_2sd = get_strangle(atm_strike + width_2sd, atm_strike - width_2sd)
+        # 5. NEW MATH LOGIC
+        atm_premium = atm_ce + atm_pe
+        
+        # Calculated purely from ATM Premium multipliers
+        val_1sd = atm_premium * 0.33
+        val_15sd = atm_premium * 0.20
+        val_2sd = atm_premium * 0.15
 
         return {
             "spot": spot_val,
             "atm_strike": atm_strike,
             "atm_straddle": atm_premium,
-            "width_base": width_1sd,
             "1sd_val": val_1sd,
             "1.5sd_val": val_15sd,
             "2sd_val": val_2sd,
-            "desc_1sd": f"±{width_1sd}",
         }, None
 
     except Exception as e:
@@ -146,16 +138,14 @@ def fetch_market_data(access_token, symbol, expiry_date):
 
 def render_chart(history_df, data_metrics):
     """
-    Draws metrics and chart. 
-    NOTE: This function does NOT create a container. 
-    It renders into whatever context is active (Window A or B).
+    Draws metrics and chart using the NEW math logic.
     """
     # Metrics Row
     m1, m2, m3, m4 = st.columns(4)
     m1.metric("Spot", f"{data_metrics['spot']}")
     m2.metric("ATM Straddle", f"₹{data_metrics['atm_straddle']:.0f}")
-    m3.metric("1SD Width", f"{data_metrics['desc_1sd']}")
-    m4.metric("1.5SD Val", f"₹{data_metrics['1.5sd_val']:.0f}")
+    m3.metric("1SD (0.33x)", f"₹{data_metrics['1sd_val']:.1f}")
+    m4.metric("2SD (0.15x)", f"₹{data_metrics['2sd_val']:.1f}")
 
     # Plotly Chart
     fig = go.Figure()
@@ -163,22 +153,22 @@ def render_chart(history_df, data_metrics):
     # ATM (Cyan)
     fig.add_trace(go.Scatter(
         x=history_df['Time'], y=history_df['ATM'],
-        mode='lines', name='ATM', line=dict(color='#22D3EE', width=3)
+        mode='lines', name='ATM Straddle', line=dict(color='#22D3EE', width=3)
     ))
-    # 1SD (Green)
+    # 1SD (Green) - 0.33x
     fig.add_trace(go.Scatter(
         x=history_df['Time'], y=history_df['1SD'],
-        mode='lines', name='1SD', line=dict(color='#4ADE80', width=2)
+        mode='lines', name='1SD (0.33x)', line=dict(color='#4ADE80', width=2)
     ))
-    # 1.5SD (Yellow)
+    # 1.5SD (Yellow) - 0.20x
     fig.add_trace(go.Scatter(
         x=history_df['Time'], y=history_df['1.5SD'],
-        mode='lines', name='1.5SD', line=dict(color='#FACC15', width=2)
+        mode='lines', name='1.5SD (0.20x)', line=dict(color='#FACC15', width=2)
     ))
-    # 2SD (Pink)
+    # 2SD (Pink) - 0.15x
     fig.add_trace(go.Scatter(
         x=history_df['Time'], y=history_df['2SD'],
-        mode='lines', name='2SD', line=dict(color='#F472B6', width=2)
+        mode='lines', name='2SD (0.15x)', line=dict(color='#F472B6', width=2)
     ))
 
     fig.update_layout(
@@ -190,11 +180,10 @@ def render_chart(history_df, data_metrics):
     )
     st.plotly_chart(fig, use_container_width=True)
 
-# --- 4. MAIN APP LAYOUT (WIDGETS OUTSIDE LOOP) ---
+# --- 4. MAIN APP LAYOUT ---
 
-# Sidebar Controls
 with st.sidebar:
-    st.header("KYOTO CONFIG")
+    st.header("KYOTO CAPITAL")
     ACCESS_TOKEN = st.text_input("API Token", type="password")
     
     st.markdown("---")
@@ -206,7 +195,7 @@ with st.sidebar:
     d_date = datetime.strptime(get_next_thursday(), "%Y-%m-%d")
     exp_a = st.date_input("Expiry A", value=d_date, key="e_a")
 
-    # --- INPUTS FOR WINDOW B (Only if Split) ---
+    # --- INPUTS FOR WINDOW B ---
     sym_b = None
     exp_b = None
     if view_mode == "Split Window (Multi)":
@@ -219,11 +208,10 @@ with st.sidebar:
     run_live = st.toggle("Start Feed", value=False)
     refresh_rate = st.slider("Speed (sec)", 1, 10, 2)
 
-# --- 5. INITIALIZATION & STATE MANAGEMENT ---
+# --- 5. STATE MANAGEMENT ---
 
 st.title("♟️ KYOTO: MULTI-STRATEGY ENGINE")
 
-# Initialize History State if missing
 if 'hist_a' not in st.session_state: st.session_state.hist_a = pd.DataFrame(columns=['Time', 'ATM', '1SD', '1.5SD', '2SD'])
 if 'hist_b' not in st.session_state: st.session_state.hist_b = pd.DataFrame(columns=['Time', 'ATM', '1SD', '1.5SD', '2SD'])
 
@@ -231,19 +219,17 @@ if 'hist_b' not in st.session_state: st.session_state.hist_b = pd.DataFrame(colu
 if 'last_sym_a' not in st.session_state: st.session_state.last_sym_a = sym_a
 if 'last_sym_b' not in st.session_state: st.session_state.last_sym_b = sym_b
 
-# CHECK FOR CHANGE: If symbol changed, wipe history!
+# Reset history on symbol change
 if st.session_state.last_sym_a != sym_a:
-    st.session_state.hist_a = pd.DataFrame(columns=['Time', 'ATM', '1SD', '1.5SD', '2SD']) # Reset
-    st.session_state.last_sym_a = sym_a # Update
+    st.session_state.hist_a = pd.DataFrame(columns=['Time', 'ATM', '1SD', '1.5SD', '2SD']) 
+    st.session_state.last_sym_a = sym_a 
 
 if sym_b and st.session_state.last_sym_b != sym_b:
-    st.session_state.hist_b = pd.DataFrame(columns=['Time', 'ATM', '1SD', '1.5SD', '2SD']) # Reset
-    st.session_state.last_sym_b = sym_b # Update
-
+    st.session_state.hist_b = pd.DataFrame(columns=['Time', 'ATM', '1SD', '1.5SD', '2SD']) 
+    st.session_state.last_sym_b = sym_b 
 
 # --- 6. EXECUTION LOOP ---
 
-# Create Placeholders (Containers)
 if view_mode == "Single Window":
     container_a = st.empty()
     container_b = None
@@ -273,13 +259,12 @@ def update_dashboard():
         }])
         st.session_state.hist_a = pd.concat([st.session_state.hist_a, new_row], ignore_index=True).tail(50)
         
-        # Render A -> We activate the container HERE
         with container_a.container():
             render_chart(st.session_state.hist_a, data_a)
     elif err_a:
         container_a.error(err_a)
 
-    # Process Window B (If active)
+    # Process Window B
     if view_mode == "Split Window (Multi)" and container_b:
         data_b, err_b = fetch_market_data(ACCESS_TOKEN, sym_b, exp_b.strftime("%Y-%m-%d"))
         if data_b:
@@ -293,13 +278,12 @@ def update_dashboard():
             }])
             st.session_state.hist_b = pd.concat([st.session_state.hist_b, new_row], ignore_index=True).tail(50)
             
-            # Render B -> We activate the container HERE
             with container_b.container():
                 render_chart(st.session_state.hist_b, data_b)
         elif err_b:
             container_b.error(err_b)
 
-# --- 7. START ENGINE ---
+# --- 7. START ---
 
 if ACCESS_TOKEN:
     if run_live:
@@ -307,6 +291,6 @@ if ACCESS_TOKEN:
             update_dashboard()
             time.sleep(refresh_rate)
     else:
-        update_dashboard() # Run once
+        update_dashboard()
 else:
     st.info("👋 Enter API Token to begin.")
