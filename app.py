@@ -5,7 +5,30 @@ import requests
 import os
 import random
 from datetime import datetime, date
+@st.cache_resource
+def load_master_contract():
+    """Loads the mini_master.json file with Cloud-Proof Pathing."""
+    
+    # 1. Get the folder where THIS script (app.py) is located
+    current_dir = os.path.dirname(os.path.abspath(__file__))
+    
+    # 2. Construct the full path to the JSON file
+    file_path = os.path.join(current_dir, "mini_master.json")
+    
+    # 3. DEBUG: If not found, list all files so you see what is wrong
+    if not os.path.exists(file_path):
+        st.error(f"❌ CRITICAL ERROR: Could not find 'mini_master.json'")
+        st.warning(f"I looked in this folder: {current_dir}")
+        st.info(f"📂 Files actually found here: {os.listdir(current_dir)}")
+        st.write("👉 Please check if the file name in GitHub matches EXACTLY (Case Sensitive!)")
+        return None
 
+    try:
+        df = pd.read_json(file_path)
+        return df
+    except Exception as e:
+        st.error(f"Error reading JSON: {e}")
+        return None
 # ==========================================
 # 1. CONFIGURATION & STYLES
 # ==========================================
