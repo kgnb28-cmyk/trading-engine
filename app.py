@@ -210,7 +210,7 @@ with st.sidebar:
 
 # --- 5. STATE MANAGEMENT ---
 
-st.title("♟️ KYOTO: MULTI-STRATEGY ENGINE")
+st.title("♟️ KYOTO: MULTI-Straddle ENGINE")
 
 if 'hist_a' not in st.session_state: st.session_state.hist_a = pd.DataFrame(columns=['Time', 'ATM', '1SD', '1.5SD', '2SD'])
 if 'hist_b' not in st.session_state: st.session_state.hist_b = pd.DataFrame(columns=['Time', 'ATM', '1SD', '1.5SD', '2SD'])
