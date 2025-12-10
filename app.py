@@ -3,311 +3,305 @@ import requests
 import pandas as pd
 import plotly.graph_objects as go
 from datetime import datetime, timedelta
-import time
+import math
 
-# --- 1. CONFIGURATION & BRANDING ---
+# --- 1. KYOTO CAPITAL: VISUAL IDENTITY ---
 st.set_page_config(
-    page_title="Kyoto Capital | Quant Dashboard",
-    page_icon="📈",
+    page_title="Kyoto Capital | Straddle Engine",
+    page_icon="♟️",
     layout="wide"
 )
 
-# Custom CSS for "Alta" Font & Theme Colors
+# Custom CSS: "Alta" Font styling + Modern Dark Theme
 st.markdown("""
     <style>
-        /* Import a font that looks like Alta or use fallback */
-        @import url('https://fonts.googleapis.com/css2?family=Cinzel:wght@400;700&family=Lato:wght@300;400;700&display=swap');
+        /* Import Fonts: Cinzel (Luxury/Alta-like) and Lato (Readability) */
+        @import url('https://fonts.googleapis.com/css2?family=Cinzel:wght@400;600;800&family=Lato:wght@300;400;700&display=swap');
         
-        /* Main Background */
+        /* DARK MODE OVERRIDES */
         .stApp {
-            background-color: #1E293B; /* Brand Color: Slate */
-            color: #FFFFFF;
+            background-color: #0F172A; /* Midnight Blue/Black */
+            color: #E2E8F0;
         }
         
-        /* Typography */
-        h1, h2, h3, h4, .stMetricLabel, .stSelectbox label, .stDateInput label {
-            font-family: 'Cinzel', serif !important; /* Alta substitute */
-            color: #FFFFFF !important;
+        /* HEADERS (Alta Style) */
+        h1, h2, h3, h4 {
+            font-family: 'Cinzel', serif !important;
+            font-weight: 600;
+            color: #F8FAFC !important;
+            letter-spacing: 1px;
         }
         
-        p, div, span, .stMetricValue {
-            font-family: 'Lato', sans-serif; /* Clean readable font for data */
-            color: #E2E8F0 !important;
+        /* METRICS CARDS */
+        div[data-testid="stMetric"] {
+            background-color: #1E293B; /* Slate Card */
+            padding: 15px;
+            border-radius: 8px;
+            border: 1px solid #334155;
+            box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1);
+        }
+        div[data-testid="stMetricLabel"] {
+            font-family: 'Lato', sans-serif;
+            color: #94A3B8 !important;
+            font-size: 14px;
+        }
+        div[data-testid="stMetricValue"] {
+            font-family: 'Cinzel', serif;
+            color: #38BDF8 !important; /* Neon Blue */
+            font-size: 28px;
         }
 
-        /* Metrics Styling */
-        div[data-testid="stMetricValue"] {
-            font-size: 36px;
-            color: #38BDF8 !important; /* Light Blue accent */
-        }
-        
-        /* Inputs */
-        .stSelectbox div[data-baseweb="select"] > div {
-            background-color: #334155;
+        /* INPUT FIELDS */
+        .stTextInput > div > div > input {
+            background-color: #1E293B;
             color: white;
             border: 1px solid #475569;
         }
+        .stSelectbox > div > div > div {
+            background-color: #1E293B;
+            color: white;
+        }
         
-        /* Buttons */
-        .stButton button {
-            background-color: #FFFFFF;
-            color: #1E293B;
-            font-weight: bold;
-            border-radius: 4px;
+        /* SIDEBAR */
+        section[data-testid="stSidebar"] {
+            background-color: #1E293B;
+            border-right: 1px solid #334155;
         }
     </style>
 """, unsafe_allow_html=True)
 
-# --- 2. SESSION STATE ---
-# Initialize session state for storing chart history
-if 'chart_data' not in st.session_state:
-    st.session_state.chart_data = pd.DataFrame(columns=['Time', 'ATM_Straddle', 'Strangle_1SD', 'Strangle_2SD'])
-
-# --- 3. HELPER FUNCTIONS ---
+# --- 2. CORE LOGIC (NO GUESSING) ---
 
 def get_next_thursday():
-    """Calculates the next Thursday's date for default expiry."""
+    """Calculates upcoming weekly expiry."""
     today = datetime.now()
-    days_ahead = 3 - today.weekday()  # Thursday is 3
-    if days_ahead <= 0: 
-        days_ahead += 7
-    next_thursday = today + timedelta(days=days_ahead)
-    return next_thursday.strftime("%Y-%m-%d")
+    days_ahead = 3 - today.weekday()
+    if days_ahead <= 0: days_ahead += 7
+    return (today + timedelta(days=days_ahead)).strftime("%Y-%m-%d")
 
-def fetch_spot_price(access_token, symbol):
-    """Fetches the underlying spot price."""
-    # Mapping for Underlying Keys
-    symbol_map = {
-        "NIFTY": "NSE_INDEX|Nifty 50",
-        "BANKNIFTY": "NSE_INDEX|Nifty Bank"
-    }
-    instrument_key = symbol_map.get(symbol)
-    
-    url = "https://api.upstox.com/v2/market-quote/ltp"
-    headers = {'Accept': 'application/json', 'Authorization': f'Bearer {access_token}'}
-    params = {'instrument_key': instrument_key}
-    
-    try:
-        response = requests.get(url, headers=headers, params=params)
-        data = response.json()
-        if data.get('status') == 'success':
-            # Handle the | vs : swap in response keys
-            key_in_response = instrument_key.replace('|', ':')
-            return data['data'][key_in_response]['last_price']
-    except Exception as e:
-        st.error(f"Error fetching Spot: {e}")
-    return None
+def round_to_strike(price, step):
+    """Rounds any number to the nearest strike step (e.g. 234 -> 250 for Nifty)."""
+    return round(price / step) * step
 
-def get_option_chain_keys(access_token, symbol, expiry_date, spot_price, step_size):
+def fetch_market_data(access_token, symbol, expiry_date):
     """
-    Fetches option chain, finds ATM, 1SD, 2SD strikes, and returns their Instrument Keys.
+    MASTER FUNCTION:
+    1. Fetches Spot Price.
+    2. Fetches Option Chain.
+    3. Calculates ATM Premium.
+    4. Calculates 1SD, 1.5SD, 2SD Distances based on ATM Premium.
+    5. Returns ALL combined premiums.
     """
-    # 1. Map Symbol to Key for Chain API
-    underlying_key = "NSE_INDEX|Nifty 50" if symbol == "NIFTY" else "NSE_INDEX|Nifty Bank"
-    
-    url = "https://api.upstox.com/v2/option/chain"
-    params = {'instrument_key': underlying_key, 'expiry_date': expiry_date}
-    headers = {'Accept': 'application/json', 'Authorization': f'Bearer {access_token}'}
-    
-    try:
-        response = requests.get(url, headers=headers, params=params)
-        data = response.json()
-        
-        if data.get('status') != 'success':
-            st.error("Failed to fetch Option Chain. Check Expiry Date.")
-            return None
+    # 1. Configuration
+    if symbol == "NIFTY":
+        spot_key = "NSE_INDEX|Nifty 50"
+        step = 50
+    else:
+        spot_key = "NSE_INDEX|Nifty Bank"
+        step = 100
 
-        chain_data = data['data']
+    headers = {'Accept': 'application/json', 'Authorization': f'Bearer {access_token}'}
+
+    # 2. Get Spot Price
+    try:
+        url_spot = "https://api.upstox.com/v2/market-quote/ltp"
+        resp_spot = requests.get(url_spot, headers=headers, params={'instrument_key': spot_key})
+        spot_data = resp_spot.json()
         
-        # 2. Calculate Target Strikes
-        # ATM: Round spot to nearest Step Size
-        atm_strike = round(spot_price / step_size) * step_size
-        
-        strikes = {
-            'ATM': atm_strike,
-            '1SD_UP': atm_strike + (1 * step_size), # 1 Step OTM Call
-            '1SD_DN': atm_strike - (1 * step_size), # 1 Step OTM Put
-            '2SD_UP': atm_strike + (2 * step_size),
-            '2SD_DN': atm_strike - (2 * step_size),
-        }
-        
-        # 3. Find Keys for these strikes
-        # We need CE for UP strikes and PE for DOWN strikes, 
-        # BUT for Strangles, we usually take OTM PE (Low Strike) and OTM CE (High Strike).
-        
-        found_keys = {}
-        
-        for item in chain_data:
-            s_price = item['strike_price']
+        if spot_data.get('status') != 'success':
+            return None, "Spot Fetch Failed"
             
-            # Capture ATM Straddle (ATM CE + ATM PE)
-            if s_price == strikes['ATM']:
-                found_keys['ATM_CE'] = item['call_options']['instrument_key']
-                found_keys['ATM_PE'] = item['put_options']['instrument_key']
-            
-            # Capture 1SD Strangle (Low PE + High CE)
-            if s_price == strikes['1SD_DN']:
-                found_keys['1SD_PE'] = item['put_options']['instrument_key']
-            if s_price == strikes['1SD_UP']:
-                found_keys['1SD_CE'] = item['call_options']['instrument_key']
-
-            # Capture 2SD Strangle (Lower PE + Higher CE)
-            if s_price == strikes['2SD_DN']:
-                found_keys['2SD_PE'] = item['put_options']['instrument_key']
-            if s_price == strikes['2SD_UP']:
-                found_keys['2SD_CE'] = item['call_options']['instrument_key']
-                
-        return found_keys, strikes
-
-    except Exception as e:
-        st.error(f"Chain Error: {e}")
-        return None, None
-
-def get_premiums(access_token, keys_dict):
-    """
-    Fetches LTP for all option keys found.
-    """
-    if not keys_dict: return None
-    
-    # Construct comma-separated string of all keys
-    all_keys = list(keys_dict.values())
-    keys_str = ",".join(all_keys)
-    
-    url = "https://api.upstox.com/v2/market-quote/ltp"
-    params = {'instrument_key': keys_str}
-    headers = {'Accept': 'application/json', 'Authorization': f'Bearer {access_token}'}
-    
-    try:
-        response = requests.get(url, headers=headers, params=params)
-        data = response.json()
+        # Handle the | to : swap
+        spot_val = spot_data['data'][spot_key.replace('|', ':')]['last_price']
         
-        if data.get('status') == 'success':
-            prices = {}
-            for k, v in keys_dict.items():
-                # Handle | vs :
-                resp_key = v.replace('|', ':')
-                price = data['data'].get(resp_key, {}).get('last_price', 0)
-                prices[k] = price
-            return prices
     except Exception as e:
-        st.error(f"Premium Fetch Error: {e}")
-    return None
+        return None, f"API Error: {e}"
 
-# --- 4. MAIN APP LAYOUT ---
+    # 3. Calculate ATM Strike
+    atm_strike = round_to_strike(spot_val, step)
 
-# Sidebar Controls
+    # 4. Fetch Option Chain to find premiums
+    try:
+        url_chain = "https://api.upstox.com/v2/option/chain"
+        params_chain = {'instrument_key': spot_key, 'expiry_date': expiry_date}
+        resp_chain = requests.get(url_chain, headers=headers, params=params_chain)
+        chain_data = resp_chain.json()
+        
+        if chain_data.get('status') != 'success':
+            return None, "Option Chain Failed (Check Expiry)"
+            
+        options_list = chain_data['data']
+        
+        # 5. Extract ATM Keys & Premium FIRST (Crucial for SD Logic)
+        atm_ce_key = None
+        atm_pe_key = None
+        
+        # Helper dictionary to store all strikes for fast lookup
+        strike_map = {} 
+        
+        for item in options_list:
+            strike = item['strike_price']
+            strike_map[strike] = {
+                'CE_Key': item['call_options']['instrument_key'],
+                'PE_Key': item['put_options']['instrument_key'],
+                'CE_LTP': item['call_options']['market_data']['ltp'],
+                'PE_LTP': item['put_options']['market_data']['ltp']
+            }
+            if strike == atm_strike:
+                atm_ce_key = item['call_options']['instrument_key']
+                atm_pe_key = item['put_options']['instrument_key']
+
+        if atm_strike not in strike_map:
+            return None, "ATM Strike not found in chain"
+
+        # 6. CALCULATE AUTOMATED SD DISTANCES
+        # Logic: Width = ATM Straddle Premium (CE + PE)
+        atm_premium = strike_map[atm_strike]['CE_LTP'] + strike_map[atm_strike]['PE_LTP']
+        
+        # Round the premium to nearest step (e.g., 213 -> 200) to find valid strikes
+        width_1sd = round_to_strike(atm_premium, step)
+        width_15sd = round_to_strike(atm_premium * 1.5, step)
+        width_2sd = round_to_strike(atm_premium * 2.0, step)
+
+        # 7. Identify Strangle Strikes
+        # 1 SD Strangle
+        s1_upper = atm_strike + width_1sd
+        s1_lower = atm_strike - width_1sd
+        
+        # 1.5 SD Strangle
+        s15_upper = atm_strike + width_15sd
+        s15_lower = atm_strike - width_15sd
+        
+        # 2 SD Strangle
+        s2_upper = atm_strike + width_2sd
+        s2_lower = atm_strike - width_2sd
+
+        # 8. Retrieve Premiums for these Strikes
+        # Helper to safely get premium sum
+        def get_strangle_prem(upper, lower):
+            if upper in strike_map and lower in strike_map:
+                return strike_map[upper]['CE_LTP'] + strike_map[lower]['PE_LTP']
+            return 0
+
+        val_1sd = get_strangle_prem(s1_upper, s1_lower)
+        val_15sd = get_strangle_prem(s15_upper, s15_lower)
+        val_2sd = get_strangle_prem(s2_upper, s2_lower)
+
+        return {
+            "spot": spot_val,
+            "atm_strike": atm_strike,
+            "atm_straddle": atm_premium,
+            "width_base": width_1sd,
+            "1sd_val": val_1sd,
+            "1.5sd_val": val_15sd,
+            "2sd_val": val_2sd,
+            "strikes": {
+                "1sd": f"{int(s1_lower)} PE & {int(s1_upper)} CE",
+                "1.5sd": f"{int(s15_lower)} PE & {int(s15_upper)} CE",
+                "2sd": f"{int(s2_lower)} PE & {int(s2_upper)} CE"
+            }
+        }, None
+
+    except Exception as e:
+        return None, f"Calculation Error: {e}"
+
+# --- 3. UI LAYOUT ---
+
+# Sidebar
 with st.sidebar:
     st.header("KYOTO CONFIG")
-    
-    # API Token
     ACCESS_TOKEN = st.text_input("API Token", type="password")
+    symbol = st.selectbox("Instrument", ["NIFTY", "BANKNIFTY"])
     
-    # Index Selection
-    symbol = st.selectbox("Select Index", ["NIFTY", "BANKNIFTY"])
+    # Auto-date
+    d_date = datetime.strptime(get_next_thursday(), "%Y-%m-%d")
+    expiry = st.date_input("Expiry", value=d_date)
     
-    # Expiry Date
-    default_date = datetime.strptime(get_next_thursday(), "%Y-%m-%d")
-    expiry = st.date_input("Expiry Date", value=default_date)
-    
-    # Step Size (Proxy for SD)
-    # Allows user to define what "1 SD" means (e.g. 50 pts or 100 pts)
-    default_step = 50 if symbol == "NIFTY" else 100
-    step_size = st.number_input("Strike Step (SD Width)", value=default_step, step=50)
-
-    # Refresh Button
-    if st.button("Refresh Data", type="primary"):
+    if st.button("RUN ANALYSIS", type="primary"):
         st.rerun()
 
-# Main Logic
-st.title(f"📊 {symbol} | STRADDLE & STRANGLE TRACKER")
+# Main Area
+st.title(f"♟️ {symbol} STRADDLE DECODER")
+
+if 'history' not in st.session_state:
+    st.session_state.history = pd.DataFrame(columns=['Time', 'ATM', '1SD', '1.5SD', '2SD'])
 
 if ACCESS_TOKEN:
-    # 1. Get Spot
-    spot_price = fetch_spot_price(ACCESS_TOKEN, symbol)
+    # Fetch Data
+    data, error = fetch_market_data(ACCESS_TOKEN, symbol, expiry.strftime("%Y-%m-%d"))
     
-    if spot_price:
-        # Display Spot & ATM
-        col1, col2, col3 = st.columns(3)
-        col1.metric("Spot Price", f"{spot_price}")
-        
-        # 2. Get Option Chain & Keys
-        expiry_str = expiry.strftime("%Y-%m-%d")
-        keys, strikes = get_option_chain_keys(ACCESS_TOKEN, symbol, expiry_str, spot_price, step_size)
-        
-        if keys and strikes:
-            col2.metric("ATM Strike", f"{strikes['ATM']}")
-            col3.metric("1SD Width", f"±{step_size}")
-            
-            # 3. Get Live Premiums
-            premiums = get_premiums(ACCESS_TOKEN, keys)
-            
-            if premiums:
-                # Calculate Strategy Values (Combined Premiums)
-                val_atm = premiums.get('ATM_CE', 0) + premiums.get('ATM_PE', 0)
-                val_1sd = premiums.get('1SD_CE', 0) + premiums.get('1SD_PE', 0)
-                val_2sd = premiums.get('2SD_CE', 0) + premiums.get('2SD_PE', 0)
-                
-                # Update Session State for Charting
-                current_time = datetime.now().strftime("%H:%M:%S")
-                new_row = {
-                    'Time': current_time, 
-                    'ATM_Straddle': val_atm,
-                    'Strangle_1SD': val_1sd,
-                    'Strangle_2SD': val_2sd
-                }
-                st.session_state.chart_data = pd.concat([st.session_state.chart_data, pd.DataFrame([new_row])], ignore_index=True)
-                
-                # --- CHARTING ---
-                st.markdown("### Combined Premium Chart")
-                
-                fig = go.Figure()
-                
-                # Trace 1: ATM Straddle
-                fig.add_trace(go.Scatter(
-                    x=st.session_state.chart_data['Time'], 
-                    y=st.session_state.chart_data['ATM_Straddle'],
-                    mode='lines+markers', name='ATM Straddle',
-                    line=dict(color='#00F0FF', width=3) # Cyan
-                ))
-                
-                # Trace 2: 1SD Strangle
-                fig.add_trace(go.Scatter(
-                    x=st.session_state.chart_data['Time'], 
-                    y=st.session_state.chart_data['Strangle_1SD'],
-                    mode='lines+markers', name=f'1SD Strangle (±{step_size})',
-                    line=dict(color='#00FF94', width=2) # Neon Green
-                ))
+    if data:
+        # A. METRICS ROW
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Spot Price", f"{data['spot']}")
+        c2.metric("ATM Strike", f"{int(data['atm_strike'])}")
+        c3.metric("ATM Premium (Width)", f"₹{data['atm_straddle']:.2f}")
+        c4.metric("Calculated SD", f"±{data['width_base']} pts")
 
-                # Trace 3: 2SD Strangle
-                fig.add_trace(go.Scatter(
-                    x=st.session_state.chart_data['Time'], 
-                    y=st.session_state.chart_data['Strangle_2SD'],
-                    mode='lines+markers', name=f'2SD Strangle (±{step_size*2})',
-                    line=dict(color='#FF0055', width=2) # Neon Red
-                ))
+        # B. UPDATE CHART HISTORY
+        now_str = datetime.now().strftime("%H:%M:%S")
+        new_row = pd.DataFrame([{
+            'Time': now_str,
+            'ATM': data['atm_straddle'],
+            '1SD': data['1sd_val'],
+            '1.5SD': data['1.5sd_val'],
+            '2SD': data['2sd_val']
+        }])
+        st.session_state.history = pd.concat([st.session_state.history, new_row], ignore_index=True)
 
-                fig.update_layout(
-                    paper_bgcolor='#1E293B',
-                    plot_bgcolor='#0F172A',
-                    font=dict(color='white', family="Lato"),
-                    xaxis=dict(showgrid=False),
-                    yaxis=dict(showgrid=True, gridcolor='#334155'),
-                    legend=dict(orientation="h", y=1.1),
-                    height=500,
-                    margin=dict(l=20, r=20, t=50, b=20)
-                )
-                
-                st.plotly_chart(fig, use_container_width=True)
-                
-                # Data Table below for granular view
-                with st.expander("View Raw Data"):
-                    st.dataframe(st.session_state.chart_data.tail(10))
-            
-            else:
-                st.warning("Could not fetch premiums. Market might be closed or Token Invalid.")
-        else:
-            st.error("Could not find matching strikes in Option Chain.")
+        # C. PLOTLY CHART (The FinanceDeft Look)
+        st.markdown("### 📈 Straddle & Strangle Premiums")
+        
+        fig = go.Figure()
+        
+        # Style: Thin neon lines, glowing effect
+        # ATM Straddle (Cyan)
+        fig.add_trace(go.Scatter(
+            x=st.session_state.history['Time'], y=st.session_state.history['ATM'],
+            mode='lines', name='ATM Straddle',
+            line=dict(color='#22D3EE', width=3) 
+        ))
+        # 1 SD (Green)
+        fig.add_trace(go.Scatter(
+            x=st.session_state.history['Time'], y=st.session_state.history['1SD'],
+            mode='lines', name=f'1 SD ({data["strikes"]["1sd"]})',
+            line=dict(color='#4ADE80', width=2)
+        ))
+        # 1.5 SD (Yellow)
+        fig.add_trace(go.Scatter(
+            x=st.session_state.history['Time'], y=st.session_state.history['1.5SD'],
+            mode='lines', name=f'1.5 SD ({data["strikes"]["1.5sd"]})',
+            line=dict(color='#FACC15', width=2)
+        ))
+        # 2 SD (Pink/Red)
+        fig.add_trace(go.Scatter(
+            x=st.session_state.history['Time'], y=st.session_state.history['2SD'],
+            mode='lines', name=f'2 SD ({data["strikes"]["2sd"]})',
+            line=dict(color='#F472B6', width=2)
+        ))
+
+        fig.update_layout(
+            paper_bgcolor='#0F172A', # Matches App Background
+            plot_bgcolor='#1E293B',  # Slightly lighter for grid
+            font=dict(family="Lato", color="#94A3B8"),
+            xaxis=dict(showgrid=False, gridcolor='#334155'),
+            yaxis=dict(showgrid=True, gridcolor='#334155', title="Combined Premium (₹)"),
+            legend=dict(orientation="h", y=1.1, font=dict(color="white")),
+            height=550,
+            margin=dict(l=20, r=20, t=40, b=20)
+        )
+        st.plotly_chart(fig, use_container_width=True)
+
+        # D. LIVE STRIKE TABLE
+        with st.expander("🔍 View Live Strike Details"):
+            st.dataframe(pd.DataFrame([
+                {"Strategy": "ATM Straddle", "Strikes": f"{int(data['atm_strike'])} CE/PE", "Premium": data['atm_straddle']},
+                {"Strategy": "1 SD Strangle", "Strikes": data['strikes']['1sd'], "Premium": data['1sd_val']},
+                {"Strategy": "1.5 SD Strangle", "Strikes": data['strikes']['1.5sd'], "Premium": data['1.5sd_val']},
+                {"Strategy": "2 SD Strangle", "Strikes": data['strikes']['2sd'], "Premium": data['2sd_val']},
+            ]), use_container_width=True)
+
     else:
-        st.error("Spot Price Fetch Failed. Check Token.")
+        st.error(f"⚠️ {error}")
 else:
-    st.info("👋 Enter your Upstox API Token in the sidebar to begin.")
+    st.info("Waiting for Access Token...")
